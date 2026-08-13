@@ -185,6 +185,7 @@ export async function POST(request: Request) {
 
   let body: { entry?: WhatsAppWebhookEntry[] }
   try {
+    console.log('[webhook payload]', rawBody)
     body = JSON.parse(rawBody)
   } catch {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })

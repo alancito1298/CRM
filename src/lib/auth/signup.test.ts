@@ -15,7 +15,7 @@ describe("createConfirmedSupabaseUser", () => {
           createUser,
         },
       },
-    } as any;
+    } as unknown as Parameters<typeof createConfirmedSupabaseUser>[0];
 
     const result = await createConfirmedSupabaseUser(adminClient, {
       email: "test@example.com",
