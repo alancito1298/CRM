@@ -1483,7 +1483,14 @@
       "step4_3": "Paste the <strong>Webhook Callback URL</strong> from above",
       "step4_4": "Enter the same <strong>Verify Token</strong> you set here",
       "step4_5": "Subscribe to \"messages\" webhook field",
-      "metaDocs": "Meta WhatsApp API Documentation"
+      "metaDocs": "Meta WhatsApp API Documentation",
+      "providerTitle": "Selección de Proveedor",
+      "providerMeta": "Meta Cloud API (Oficial Directo)",
+      "providerTwilio": "Twilio BSP (Proveedor de WhatsApp)",
+      "twilioAccountSid": "Account SID de Twilio",
+      "twilioAuthToken": "Auth Token de Twilio",
+      "twilioPhoneNumber": "Número de WhatsApp de Twilio",
+      "twilioWebhookHint": "Usa esta URL como la URL de Webhook en Twilio Console:"
     },
     "sections": {
       "overview": "Overview",
