@@ -118,8 +118,30 @@ export function ConversationList({
       setLoading(false);
     })();
 
+    // Realtime: refetch when conversations are inserted or updated
+    const channel = supabase
+      .channel("conversations-realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "conversations" },
+        () => {
+          if (cancelled) return;
+          supabase
+            .from("conversations")
+            .select(CONVERSATION_SELECT)
+            .order("last_message_at", { ascending: false })
+            .then(({ data: fresh }) => {
+              if (!cancelled && fresh) {
+                onConversationsLoadedRef.current(normalizeConversations(fresh));
+              }
+            });
+        }
+      )
+      .subscribe();
+
     return () => {
       cancelled = true;
+      supabase.removeChannel(channel);
     };
     // `resyncToken` is included so the parent can force a refetch when
     // the realtime channel reconnects or the tab regains focus — catches

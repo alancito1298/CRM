@@ -29,6 +29,7 @@ import {
   sendInteractiveList,
   type MediaKind,
 } from '@/lib/whatsapp/meta-api';
+import { sendTwilioMessage } from '@/lib/whatsapp/twilio-api';
 import {
   validateInteractivePayload,
   interactivePayloadPreviewText,
@@ -330,6 +331,47 @@ export async function sendMessageToConversation(
   }
 
   const attempt = async (phone: string): Promise<string> => {
+    // ── WhatsApp Web Service (localhost:3001) — gratis, sin API externa ──
+    try {
+      const waServiceUrl = process.env.WA_SERVICE_URL || 'http://localhost:3001';
+      const statusRes = await fetch(`${waServiceUrl}/status`, { signal: AbortSignal.timeout(2000) });
+      if (statusRes.ok) {
+        const { status: waStatus } = await statusRes.json() as { status: string };
+        if (waStatus === 'ready') {
+          const sendRes = await fetch(`${waServiceUrl}/send`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              to: phone,
+              message: contentText || (messageType === 'template' ? `[Plantilla: ${templateName}]` : ''),
+              mediaUrl: mediaUrl || undefined,
+              fromCrm: true,
+            }),
+            signal: AbortSignal.timeout(15000),
+          });
+          if (sendRes.ok) {
+            const data = await sendRes.json() as { messageId?: string };
+            return data.messageId || `wa-web-${Date.now()}`;
+          }
+        }
+      }
+    } catch {
+      // Servicio no disponible, continuar con Twilio / Meta
+    }
+
+    if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+      const twilioFrom = process.env.TWILIO_PHONE_NUMBER || '+14155238886';
+      const result = await sendTwilioMessage({
+        accountSid: process.env.TWILIO_ACCOUNT_SID,
+        authToken: process.env.TWILIO_AUTH_TOKEN,
+        from: twilioFrom,
+        to: phone,
+        body: contentText || (messageType === 'template' ? `[Plantilla: ${templateName}]` : null),
+        mediaUrl: mediaUrl || null,
+      });
+      return result.messageSid;
+    }
+
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
         phoneNumberId: config.phone_number_id,
