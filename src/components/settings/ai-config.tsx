@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { Loader2, Sparkles, CheckCircle2, Trash2, Eye, EyeOff } from 'lucide-react';
+import { Loader2, Sparkles, CheckCircle2, Trash2, Eye, EyeOff, ExternalLink } from 'lucide-react';
 import { useAuth } from '@/hooks/use-auth';
 import { canEditSettings } from '@/lib/auth/roles';
 import { Button } from '@/components/ui/button';
@@ -38,17 +38,50 @@ const MASKED_KEY = '••••••••••••••••';
 // unassigned" choice gets a sentinel that maps to null in the payload.
 const HANDOFF_QUEUE = '__queue__';
 
-const PROVIDER_LABEL: Record<AiProvider, string> = {
-  openai: 'OpenAI',
+export const PROVIDER_LABEL: Record<AiProvider, string> = {
+  groq: 'Groq (Ultra Rápido)',
+  openai: 'OpenAI (ChatGPT)',
   anthropic: 'Anthropic (Claude)',
-  groq: 'Groq',
   gemini: 'Google Gemini',
 };
 
+export const POPULAR_MODELS: Record<
+  AiProvider,
+  { id: string; name: string; badge?: string }[]
+> = {
+  groq: [
+    { id: 'qwen/qwen3.8-27b', name: 'Qwen 3.8 27B', badge: 'Recomendado' },
+    { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B Versatile', badge: 'Potente' },
+    { id: 'llama-3.1-8b-instant', name: 'Llama 3.1 8B Instant', badge: 'Ultra Rápido' },
+    { id: 'mixtral-8x7b-32768', name: 'Mixtral 8x7B', badge: 'Contexto 32k' },
+  ],
+  openai: [
+    { id: 'gpt-4o-mini', name: 'GPT-4o Mini', badge: 'Recomendado' },
+    { id: 'gpt-4o', name: 'GPT-4o', badge: 'Más Inteligente' },
+    { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo', badge: 'Básico' },
+  ],
+  anthropic: [
+    { id: 'claude-3-5-haiku-latest', name: 'Claude 3.5 Haiku', badge: 'Recomendado' },
+    { id: 'claude-3-5-sonnet-latest', name: 'Claude 3.5 Sonnet', badge: 'Avanzado' },
+  ],
+  gemini: [
+    { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', badge: 'Recomendado' },
+    { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', badge: 'Avanzado' },
+    { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', badge: 'Nueva Gen' },
+  ],
+};
+
+const PROVIDER_DOCS: Record<AiProvider, { url: string; label: string }> = {
+  groq: { url: 'https://console.groq.com/keys', label: 'console.groq.com' },
+  openai: { url: 'https://platform.openai.com/api-keys', label: 'platform.openai.com' },
+  anthropic: { url: 'https://console.anthropic.com/settings/keys', label: 'console.anthropic.com' },
+  gemini: { url: 'https://aistudio.google.com/app/apikey', label: 'aistudio.google.com' },
+};
+
 const KEY_PLACEHOLDER: Record<AiProvider, string> = {
+  groq: 'gsk_...',
   openai: 'sk-...',
   anthropic: 'sk-ant-...',
-  groq: 'gsk-...',
   gemini: 'AIzaSy...',
 };
 
@@ -63,8 +96,9 @@ export function AiConfig() {
   const [removing, setRemoving] = useState(false);
 
   const [configured, setConfigured] = useState(false);
-  const [provider, setProvider] = useState<AiProvider>('openai');
-  const [model, setModel] = useState(AI_PROVIDER_DEFAULT_MODEL.openai);
+  const [storedProvider, setStoredProvider] = useState<AiProvider | null>(null);
+  const [provider, setProvider] = useState<AiProvider>('groq');
+  const [model, setModel] = useState(AI_PROVIDER_DEFAULT_MODEL.groq);
   const [apiKey, setApiKey] = useState('');
   const [keyEdited, setKeyEdited] = useState(false);
   const [showKey, setShowKey] = useState(false);
@@ -97,6 +131,7 @@ export function AiConfig() {
       }
       if (data.configured) {
         setConfigured(true);
+        setStoredProvider(data.provider);
         setProvider(data.provider);
         setModel(data.model);
         setSystemPrompt(data.system_prompt ?? '');
@@ -128,17 +163,22 @@ export function AiConfig() {
     void fetchAccountMembers().then(setMembers);
   }, [accountId, fetchConfig]);
 
-  // Swap the model default when the provider changes, unless the user
-  // typed a custom model.
+  // Swap the model default and key handling when the provider changes
   const handleProviderChange = (next: AiProvider) => {
     setProvider(next);
-    const isDefaultModel =
-      model === AI_PROVIDER_DEFAULT_MODEL.openai ||
-      model === AI_PROVIDER_DEFAULT_MODEL.anthropic ||
-      model === AI_PROVIDER_DEFAULT_MODEL.groq ||
-      model === AI_PROVIDER_DEFAULT_MODEL.gemini ||
-      model.trim() === '';
-    if (isDefaultModel) setModel(AI_PROVIDER_DEFAULT_MODEL[next]);
+    const popularForNext = POPULAR_MODELS[next] || [];
+    const isKnownForNext = popularForNext.some((m) => m.id === model);
+    if (!isKnownForNext) {
+      setModel(AI_PROVIDER_DEFAULT_MODEL[next] || popularForNext[0]?.id || '');
+    }
+
+    if (next === storedProvider && hasStoredKey) {
+      setApiKey(MASKED_KEY);
+      setKeyEdited(false);
+    } else if (next !== storedProvider) {
+      setApiKey('');
+      setKeyEdited(true);
+    }
   };
 
   const keyPayload = () => (keyEdited ? apiKey.trim() : undefined);
@@ -239,13 +279,14 @@ export function AiConfig() {
   if (loading || profileLoading) {
     return (
       <div className="flex items-center justify-center py-16 text-muted-foreground">
-        <Loader2 className="mr-2 h-4 w-4 animate-spin" /> {t('loadFailed')} {/* Re-using label or a global one, wait, loading is better. Let's use useTranslations from overview or just hardcode Loading... actually I should add loading to aiConfig */}
-        {/* Wait, I didn't add loading to aiConfig. I'll just use loading. */}
+        <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Cargando configuración de IA...
       </div>
     );
   }
 
   const disabled = !canEdit || saving;
+  const isCustomModel =
+    !POPULAR_MODELS[provider]?.some((m) => m.id === model) || model === '';
 
   return (
     <div>
@@ -283,24 +324,84 @@ export function AiConfig() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="openai">{PROVIDER_LABEL.openai}</SelectItem>
-                    <SelectItem value="anthropic">
-                      {PROVIDER_LABEL.anthropic}
-                    </SelectItem>
                     <SelectItem value="groq">{PROVIDER_LABEL.groq}</SelectItem>
+                    <SelectItem value="openai">{PROVIDER_LABEL.openai}</SelectItem>
+                    <SelectItem value="anthropic">{PROVIDER_LABEL.anthropic}</SelectItem>
+                    <SelectItem value="gemini">{PROVIDER_LABEL.gemini}</SelectItem>
                   </SelectContent>
                 </Select>
+                <p className="text-[11px] text-muted-foreground">
+                  Elige el motor de IA que responderá automáticamente y redactará mensajes.
+                </p>
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="ai-model">{t('model')}</Label>
-                <Input
-                  id="ai-model"
-                  value={model}
-                  onChange={(e) => setModel(e.target.value)}
-                  placeholder={AI_PROVIDER_DEFAULT_MODEL[provider]}
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="ai-model">{t('model')}</Label>
+                  {isCustomModel && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const def = AI_PROVIDER_DEFAULT_MODEL[provider];
+                        setModel(def);
+                      }}
+                      className="text-xs text-primary hover:underline"
+                    >
+                      Volver a sugeridos
+                    </button>
+                  )}
+                </div>
+
+                <Select
+                  value={isCustomModel ? 'custom' : model}
+                  onValueChange={(val) => {
+                    if (val === 'custom') {
+                      setModel('');
+                    } else if (val) {
+                      setModel(val);
+                    }
+                  }}
                   disabled={disabled}
-                />
+                >
+                  <SelectTrigger id="ai-model-select">
+                    <SelectValue placeholder="Selecciona un modelo..." />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {POPULAR_MODELS[provider]?.map((m) => (
+                      <SelectItem key={m.id} value={m.id}>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-medium">{m.name}</span>
+                          {m.badge && (
+                            <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+                              {m.badge}
+                            </span>
+                          )}
+                        </div>
+                      </SelectItem>
+                    ))}
+                    <SelectItem value="custom">Otro modelo (personalizado)...</SelectItem>
+                  </SelectContent>
+                </Select>
+
+                {isCustomModel ? (
+                  <div className="mt-1.5 space-y-1">
+                    <Input
+                      id="ai-model"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      placeholder={AI_PROVIDER_DEFAULT_MODEL[provider]}
+                      disabled={disabled}
+                      autoFocus
+                    />
+                    <p className="text-[11px] text-muted-foreground">
+                      Escribe el identificador exacto del modelo soportado por {PROVIDER_LABEL[provider]}.
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-muted-foreground font-mono">
+                    ID: {model}
+                  </p>
+                )}
               </div>
             </div>
 
@@ -317,7 +418,7 @@ export function AiConfig() {
                       setKeyEdited(true);
                     }}
                     onFocus={() => {
-                      if (!keyEdited && hasStoredKey) {
+                      if (!keyEdited && hasStoredKey && provider === storedProvider) {
                         setApiKey('');
                         setKeyEdited(true);
                       }
@@ -351,6 +452,27 @@ export function AiConfig() {
                   )}
                   {t('testKey')}
                 </Button>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-1 text-xs text-muted-foreground">
+                <span>
+                  {keyEdited
+                    ? 'Introduce la clave de API para este proveedor.'
+                    : hasStoredKey && provider === storedProvider
+                      ? '✓ Clave guardada de forma segura (AES-256).'
+                      : 'Introduce la clave de API para este proveedor.'}
+                </span>
+                {PROVIDER_DOCS[provider] && (
+                  <a
+                    href={PROVIDER_DOCS[provider].url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-primary hover:underline font-medium"
+                  >
+                    Obtener API Key en {PROVIDER_DOCS[provider].label}
+                    <ExternalLink className="h-3 w-3" />
+                  </a>
+                )}
               </div>
             </div>
 

@@ -82,6 +82,57 @@ export async function engineSendText(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
+  // ── WhatsApp Web Service (localhost:3001) — gratis, sin API externa ──
+  try {
+    const waServiceUrl = process.env.WA_SERVICE_URL || 'http://localhost:3001'
+    const statusRes = await fetch(`${waServiceUrl}/status`, { signal: AbortSignal.timeout(2000) })
+    if (statusRes.ok) {
+      const { status: waStatus } = (await statusRes.json()) as { status: string }
+      if (waStatus === 'ready') {
+        const sendRes = await fetch(`${waServiceUrl}/send`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            to: contact.phone,
+            message: args.text,
+            fromCrm: true,
+          }),
+          signal: AbortSignal.timeout(15000),
+        })
+        if (sendRes.ok) {
+          const data = (await sendRes.json()) as { messageId?: string }
+          const waMessageId = data.messageId || `wa-web-${Date.now()}`
+
+          const { error: msgErr } = await db.from('messages').insert({
+            conversation_id: args.conversationId,
+            sender_type: 'bot',
+            content_type: 'text',
+            content_text: args.text,
+            message_id: waMessageId,
+            status: 'sent',
+            ai_generated: args.aiGenerated ?? false,
+          })
+          if (msgErr) {
+            console.error('[engineSendText] DB insert failed:', msgErr.message)
+          }
+
+          await db
+            .from('conversations')
+            .update({
+              last_message_text: args.text,
+              last_message_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', args.conversationId)
+
+          return { whatsapp_message_id: waMessageId }
+        }
+      }
+    }
+  } catch {
+    // Local service not ready, fall back to Meta
+  }
+
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
     .select('*')

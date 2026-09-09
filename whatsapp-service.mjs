@@ -29,6 +29,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 let currentQR = null;
 let status = 'initializing'; // initializing | qr | authenticated | ready | error
 let whatsappClient = null;
+let readyTimestamp = 0;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 function normalizePhone(phone) {
@@ -56,6 +57,7 @@ function toWAId(phone) {
 }
 
 const recentSentIds = new Set();
+const recentProcessedIds = new Set();
 
 // ─── Resolver teléfono real a partir de LID o JID ─────────────────────────
 async function resolveRealPhone(waId) {
@@ -254,13 +256,101 @@ async function saveMessageToSupabase({ phone, name, body, mediaUrl, messageId, s
       .eq('id', conversation.id);
 
     console.log(`[WA-Service] ✅ Mensaje (${senderType}) guardado en conversación ${conversation.id}`);
+
+    // 6. Si es mensaje de cliente, disparar auto-reply de IA
+    if (senderType === 'customer') {
+      const crmUrl = process.env.CRM_URL || 'http://localhost:3000';
+      fetch(`${crmUrl}/api/ai/inbound`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountId,
+          conversationId: conversation.id,
+          contactId: contact.id,
+          configOwnerUserId: userId,
+        }),
+      })
+        .then((res) => {
+          if (res.ok) {
+            console.log(`[WA-Service] 🤖 Auto-reply de IA disparado para conv ${conversation.id}`);
+          } else {
+            console.warn(`[WA-Service] AI inbound respondió status ${res.status}`);
+          }
+        })
+        .catch((err) => {
+          console.error('[WA-Service] Error llamando a /api/ai/inbound:', err.message);
+        });
+    }
   } catch (err) {
     console.error('[WA-Service] Error guardando mensaje en Supabase:', err.message);
   }
 }
 
+// ─── Polling de respaldo para mensajes recientes en WhatsApp Web ───────────
+async function checkUnreadChats() {
+  if (!whatsappClient?.pupPage) return;
+  try {
+    const latestList = await whatsappClient.pupPage.evaluate(() => {
+      try {
+        const { Chat } = window.require('WAWebCollections');
+        const chats = Chat.getModelsArray ? Chat.getModelsArray() : [];
+        const items = [];
+        for (const c of chats.slice(0, 15)) {
+          const msgs = c.msgs && c.msgs.getModelsArray ? c.msgs.getModelsArray() : [];
+          const last = msgs[msgs.length - 1];
+          if (last && !last.id?.fromMe) {
+            items.push({
+              chatId: c.id?._serialized,
+              name: c.name || c.formattedTitle || '',
+              body: last.body || '',
+              messageId: last.id?._serialized || last.id?.id || '',
+              timestamp: last.t,
+            });
+          }
+        }
+        return items;
+      } catch {
+        return [];
+      }
+    });
+
+    if (Array.isArray(latestList) && latestList.length > 0) {
+      for (const item of latestList) {
+        if (!item.messageId || recentProcessedIds.has(item.messageId)) continue;
+
+        // Verificar si ya existe en Supabase
+        const { data: existing } = await supabase
+          .from('messages')
+          .select('id')
+          .eq('message_id', item.messageId)
+          .maybeSingle();
+
+        if (existing) {
+          recentProcessedIds.add(item.messageId);
+          continue;
+        }
+
+        recentProcessedIds.add(item.messageId);
+        let senderPhone = await resolveRealPhone(item.chatId);
+        console.log(`[WA-Service] 📬 Mensaje entrante detectado de +${senderPhone}: "${item.body}"`);
+
+        await saveMessageToSupabase({
+          phone: senderPhone,
+          name: item.name,
+          body: item.body,
+          messageId: item.messageId,
+          senderType: 'customer',
+        });
+      }
+    }
+  } catch (err) {
+    // ignore
+  }
+}
+
 // ─── WhatsApp Web Client ────────────────────────────────────────────────────
 function initWhatsApp() {
+  setInterval(checkUnreadChats, 2500);
   whatsappClient = new Client({
     authStrategy: new LocalAuth({ clientId: 'crm-production' }),
     puppeteer: {
@@ -281,18 +371,40 @@ function initWhatsApp() {
     console.log('[WA-Service] ✅ Autenticado');
   });
 
-  let readyTimestamp = Math.floor(Date.now() / 1000);
+  // Cerrar periódicamente cualquier modal/popup de WhatsApp Web (ej: "What's new")
+  setInterval(async () => {
+    try {
+      if (whatsappClient?.pupPage) {
+        await whatsappClient.pupPage.evaluate(() => {
+          const dialog = document.querySelector('div[role="dialog"]');
+          if (dialog) {
+            const btn = dialog.querySelector('[aria-label="Close"]') ||
+                        dialog.querySelector('[data-icon="x"]')?.closest('button') ||
+                        dialog.querySelector('button[aria-label="Cerrar"]') ||
+                        dialog.querySelector('button');
+            if (btn) btn.click();
+          }
+        });
+      }
+    } catch {}
+  }, 2000);
+
+  readyTimestamp = Math.floor(Date.now() / 1000) - 120; // 2 min margin
 
   whatsappClient.on('ready', () => {
     status = 'ready';
-    readyTimestamp = Math.floor(Date.now() / 1000);
+    readyTimestamp = Math.floor(Date.now() / 1000) - 120;
     console.log('[WA-Service] ✅ WhatsApp listo para enviar y recibir mensajes');
   });
 
   whatsappClient.on('message', async (msg) => {
+    console.log(`[WA-Service] 📨 on('message'): fromMe=${msg.fromMe}, from=${msg.from}, to=${msg.to}, timestamp=${msg.timestamp}, body="${msg.body?.slice(0, 30)}"`);
     if (msg.fromMe) return;
     if (msg.from.includes('@g.us')) return;
-    if (msg.timestamp && msg.timestamp < readyTimestamp) return;
+    if (msg.timestamp && msg.timestamp < readyTimestamp) {
+      console.log(`[WA-Service] ⏩ Omitiendo mensaje antiguo (${msg.timestamp} < ${readyTimestamp})`);
+      return;
+    }
 
     let senderPhone = await resolveRealPhone(msg.author || msg.from);
     let senderName = null;
@@ -331,6 +443,7 @@ function initWhatsApp() {
 
   // Sincronizar mensajes enviados directamente desde la app de WhatsApp del celular
   whatsappClient.on('message_create', async (msg) => {
+    console.log(`[WA-Service] 📝 on('message_create'): fromMe=${msg.fromMe}, from=${msg.from}, to=${msg.to}, timestamp=${msg.timestamp}, body="${msg.body?.slice(0, 30)}"`);
     if (!msg.fromMe) return;
     if (msg.to && msg.to.includes('@g.us')) return;
     if (msg.timestamp && msg.timestamp < readyTimestamp) return;
@@ -389,7 +502,8 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     const realPhone = whatsappClient?.info?.wid?.user ? `+${whatsappClient.info.wid.user}` : CRM_PHONE;
-    res.end(JSON.stringify({ status, phone: realPhone, info: whatsappClient?.info || null }));
+    const isConnected = status === 'ready' || status === 'authenticated' || !!whatsappClient?.info?.wid;
+    res.end(JSON.stringify({ status: isConnected ? 'ready' : status, phone: realPhone, info: whatsappClient?.info || null }));
     return;
   }
 
@@ -399,6 +513,116 @@ const server = http.createServer(async (req, res) => {
     const resolved = await resolveRealPhone(id);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ id, resolved, phone: `+${resolved}` }));
+    return;
+  }
+
+  // GET /debug — depuración de WhatsApp Web
+  if (req.method === 'GET' && url.pathname === '/debug') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    try {
+      const debugInfo = await whatsappClient?.pupPage?.evaluate(() => {
+        return {
+          hasWWebJS: typeof window.WWebJS !== 'undefined',
+          hasOnAddMessageEvent: typeof window.onAddMessageEvent === 'function',
+          hasOnMessage: typeof window.onMessage === 'function',
+          title: document.title,
+          url: window.location.href,
+        };
+      }) || null;
+      res.end(JSON.stringify({ status, readyTimestamp, debugInfo }));
+    } catch (e) {
+      res.end(JSON.stringify({ status, readyTimestamp, error: e.message }));
+    }
+    return;
+  }
+
+  // GET /test-check — probar lectura directa de chats
+  if (req.method === 'GET' && url.pathname === '/test-check') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    try {
+      const data = await whatsappClient?.pupPage?.evaluate(() => {
+        try {
+          const res = {};
+          res.hasRequire = typeof window.require === 'function';
+          if (res.hasRequire) {
+            try {
+              const { ChatCollection } = window.require('WAWebChatCollection');
+              res.chatCollectionFound = !!ChatCollection;
+              res.chatCount = ChatCollection?.models?.length;
+              if (ChatCollection?.models?.length > 0) {
+                res.sampleChats = ChatCollection.models.slice(0, 3).map(c => ({
+                  id: c.id?._serialized,
+                  name: c.name || c.formattedTitle,
+                  unread: c.unreadCount,
+                  msgsLen: c.msgs?.models?.length,
+                  lastMsg: c.msgs?.models?.[c.msgs.models.length - 1]?.body,
+                  lastFromMe: c.msgs?.models?.[c.msgs.models.length - 1]?.id?.fromMe,
+                }));
+              }
+            } catch (e) {
+              res.chatColError = e.message;
+            }
+
+            try {
+              const { Msg } = window.require('WAWebCollections');
+              res.msgCount = Msg?.models?.length;
+            } catch (e) {
+              res.msgError = e.message;
+            }
+          }
+          return res;
+        } catch (err) {
+          return { error: err.message };
+        }
+      }) || null;
+      res.end(JSON.stringify(data));
+    } catch (e) {
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /dismiss — cerrar modales emergentes
+  if (req.method === 'GET' && url.pathname === '/dismiss') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    try {
+      const dismissed = await whatsappClient?.pupPage?.evaluate(() => {
+        const dialog = document.querySelector('div[role="dialog"]');
+        if (dialog) {
+          const btn = dialog.querySelector('[aria-label="Close"]') ||
+                      dialog.querySelector('[data-icon="x"]')?.closest('button') ||
+                      dialog.querySelector('button[aria-label="Cerrar"]') ||
+                      dialog.querySelector('button');
+          if (btn) {
+            btn.click();
+            return { closed: true, text: btn.innerText || btn.getAttribute('aria-label') };
+          }
+        }
+        return { closed: false };
+      });
+      await whatsappClient?.pupPage?.keyboard?.press('Escape');
+      res.end(JSON.stringify({ dismissed }));
+    } catch (e) {
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /screenshot — captura de pantalla de WhatsApp Web
+  if (req.method === 'GET' && url.pathname === '/screenshot') {
+    try {
+      const buffer = await whatsappClient?.pupPage?.screenshot();
+      if (buffer) {
+        res.writeHead(200, { 'Content-Type': 'image/png' });
+        res.end(buffer);
+        return;
+      }
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('No pupPage available');
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('Error taking screenshot: ' + e.message);
+    }
     return;
   }
 
@@ -436,7 +660,7 @@ const server = http.createServer(async (req, res) => {
 <body><div class="card">
   <div style="font-size:44px;margin-bottom:12px">💬</div>
   <h1>WhatsApp CRM</h1>
-  ${status === 'ready'
+  ${status === 'ready' || status === 'authenticated' || !!whatsappClient?.info?.wid
     ? `<div class="ready">✅ Conectado<br><span style="font-size:13px;font-weight:400;color:#86efac;margin-top:6px;display:block">${CRM_PHONE}</span></div>`
     : status === 'qr' && qrImg
       ? `<p>Escaneá con tu celular para conectar <strong>${CRM_PHONE}</strong></p>
@@ -455,7 +679,8 @@ const server = http.createServer(async (req, res) => {
 
   // POST /send — enviar mensaje desde el CRM
   if (req.method === 'POST' && url.pathname === '/send') {
-    if (status !== 'ready') {
+    const isConnected = status === 'ready' || status === 'authenticated' || !!whatsappClient?.info?.wid;
+    if (!isConnected) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'WhatsApp no conectado', status }));
       return;
