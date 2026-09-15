@@ -1,0 +1,15 @@
+# Files and directories to ignore when deploying with Vercel CLI
+
+.wwebjs_auth
+.wwebjs_cache
+.next
+node_modules
+.git
+.github
+.vscode
+.agents
+.claude
+skills-lock.json
+setup_database.sql
+*.log
+*.tsbuildinfo
