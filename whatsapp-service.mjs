@@ -10,9 +10,13 @@
  */
 
 import http from 'http';
+import crypto from 'crypto';
+import dotenv from 'dotenv';
 import qrcode from 'qrcode';
 import { createClient } from '@supabase/supabase-js';
 import pkg from 'whatsapp-web.js';
+
+dotenv.config({ path: '.env.local' });
 
 const { Client, LocalAuth, MessageMedia } = pkg;
 
@@ -20,6 +24,7 @@ const { Client, LocalAuth, MessageMedia } = pkg;
 const PORT = process.env.WA_SERVICE_PORT || 3001;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://pjueqfhelyvejyubdkcr.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBqdWVxZmhlbHl2ZWp5dWJka2NyIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4ODUzOTkwOCwiZXhwIjoyMTA0MTE1OTA4fQ.ygA8b-Ns3pm2vT2yyL7eAA6rOnf24RRTAcJbPPFAVWo';
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'cedc22ba5eec9ef8f35bd3fc445f0f9638ab8514125e0f1b638fca1f7e9302e3';
 const CRM_PHONE = process.env.CRM_PHONE || '+5491154101146'; // Número del CRM
 
 globalThis.WebSocket = class {};
@@ -58,6 +63,35 @@ function toWAId(phone) {
 
 const recentSentIds = new Set();
 const recentProcessedIds = new Set();
+
+function decryptKey(encryptedText) {
+  if (!encryptedText) return null;
+  try {
+    const parts = encryptedText.split(':');
+    if (parts.length === 3) {
+      const [ivHex, ctHex, tagHex] = parts;
+      const iv = Buffer.from(ivHex, 'hex');
+      const authTag = Buffer.from(tagHex, 'hex');
+      const decipher = crypto.createDecipheriv('aes-256-gcm', Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+      decipher.setAuthTag(authTag);
+      let decrypted = decipher.update(ctHex, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+      return decrypted;
+    }
+    if (parts.length === 2) {
+      const [ivHex, ctHex] = parts;
+      const iv = Buffer.from(ivHex, 'hex');
+      const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+      let decrypted = decipher.update(ctHex, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+      return decrypted;
+    }
+    return encryptedText;
+  } catch (err) {
+    console.error('[WA-Service] Error desencriptando API key:', err.message);
+    return null;
+  }
+}
 
 // ─── Resolver teléfono real a partir de LID o JID ─────────────────────────
 async function resolveRealPhone(waId) {
@@ -137,11 +171,230 @@ async function resolveRealPhone(waId) {
   return clean;
 }
 
+// ─── Auto-Reply de Inteligencia Artificial ───────────────────────────────────
+async function handleAiAutoReply({ accountId, conversationId, contactId, contactPhone }) {
+  try {
+    // 1. Obtener la config de IA activa para la cuenta
+    const { data: config, error: cfgErr } = await supabase
+      .from('ai_configs')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('is_active', true)
+      .maybeSingle();
+
+    if (cfgErr || !config) {
+      console.log('[WA-Service AI] No hay ai_configs activa');
+      return;
+    }
+
+    if (!config.auto_reply_enabled) {
+      console.log('[WA-Service AI] Auto-reply no está habilitado');
+      return;
+    }
+
+    // 2. Verificar conversación
+    const { data: conv, error: convErr } = await supabase
+      .from('conversations')
+      .select('id, assigned_agent_id, ai_autoreply_disabled, ai_reply_count')
+      .eq('id', conversationId)
+      .maybeSingle();
+
+    if (convErr || !conv) return;
+    if (conv.assigned_agent_id) {
+      console.log(`[WA-Service AI] Hay un agente humano asignado en conv ${conversationId} — omitiendo IA`);
+      return;
+    }
+
+    // Auto-heal si quedó marcado ai_autoreply_disabled por un handoff previo sin agente asignado
+    if (conv.ai_autoreply_disabled) {
+      await supabase
+        .from('conversations')
+        .update({ ai_autoreply_disabled: false, ai_handoff_summary: null })
+        .eq('id', conversationId);
+    }
+
+    // El bot nunca deja de contestar mientras no haya un agente humano asignado
+    if (conv.assigned_agent_id) {
+      console.log(`[WA-Service AI] Hay un agente humano asignado en conv ${conversationId} — omitiendo IA`);
+      return;
+    }
+
+    // 3. Obtener últimos mensajes para dar contexto/memoria a la IA (los más recientes primero)
+    const { data: rawMsgs } = await supabase
+      .from('messages')
+      .select('sender_type, content_text, created_at')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: false })
+      .limit(12);
+
+    const recentMsgs = rawMsgs ? rawMsgs.reverse() : [];
+
+    const messages = [];
+    if (config.system_prompt) {
+      messages.push({ role: 'system', content: config.system_prompt });
+    }
+
+    if (recentMsgs && recentMsgs.length > 0) {
+      let lastRole = null;
+      let lastText = null;
+      for (const m of recentMsgs) {
+        if (!m.content_text) continue;
+        const role = m.sender_type === 'customer' ? 'user' : 'assistant';
+        const trimmed = m.content_text.trim();
+        // Evitar duplicados idénticos consecutivos en el historial
+        if (role === lastRole && trimmed === lastText) continue;
+        messages.push({ role, content: trimmed });
+        lastRole = role;
+        lastText = trimmed;
+      }
+    }
+
+    // Asegurarse de que el último mensaje sea del cliente para que la IA responda a él
+    while (messages.length > 1 && messages[messages.length - 1].role === 'assistant') {
+      messages.pop();
+    }
+
+    // Verificar que haya al menos un mensaje del usuario
+    if (messages.filter(m => m.role === 'user').length === 0) {
+      return;
+    }
+
+    // 4. Desencriptar API Key
+    const apiKey = decryptKey(config.api_key);
+    if (!apiKey) {
+      console.error('[WA-Service AI] Error: No se pudo desencriptar la API key');
+      return;
+    }
+
+    const modelName = config.model || 'qwen/qwen3.8-27b';
+    console.log(`[WA-Service AI] 🧠 Generando respuesta con ${config.provider} (${modelName})...`);
+
+    // 5. Llamar al proveedor de IA
+    let replyText = '';
+    if (config.provider === 'groq') {
+      const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: modelName,
+          messages,
+          max_tokens: 250,
+          temperature: 0.6,
+        }),
+      });
+
+      if (!resp.ok) {
+        const errBody = await resp.text();
+        console.error(`[WA-Service AI] Error HTTP ${resp.status} de Groq:`, errBody);
+      } else {
+        const resJson = await resp.json();
+        replyText = resJson.choices?.[0]?.message?.content?.trim() || '';
+      }
+    } else if (config.provider === 'openai') {
+      const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: modelName,
+          messages,
+          max_tokens: 450,
+          temperature: 0.7,
+        }),
+      });
+
+      if (!resp.ok) {
+        console.error('[WA-Service AI] Error HTTP de OpenAI:', resp.status, await resp.text());
+      } else {
+        const resJson = await resp.json();
+        replyText = resJson.choices?.[0]?.message?.content?.trim() || '';
+      }
+    } else if (config.provider === 'anthropic') {
+      const systemMsg = messages.find(m => m.role === 'system')?.content || '';
+      const userAndAssistantMsgs = messages.filter(m => m.role !== 'system');
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: modelName,
+          system: systemMsg,
+          messages: userAndAssistantMsgs,
+          max_tokens: 450,
+        }),
+      });
+
+      if (!resp.ok) {
+        console.error('[WA-Service AI] Error HTTP de Anthropic:', resp.status, await resp.text());
+      } else {
+        const resJson = await resp.json();
+        replyText = resJson.content?.[0]?.text?.trim() || '';
+      }
+    }
+
+    if (!replyText) {
+      console.warn('[WA-Service AI] Activando respuesta de respaldo con especialista...');
+      replyText = 'Para brindarte una información más acertada y detallada sobre tu consulta, una persona especializada en el tema se pondrá en contacto contigo por este mismo chat a la brevedad. ¿A qué rubro se dedica tu negocio?';
+    }
+
+    console.log(`[WA-Service AI] 💬 Respuesta generada: "${replyText}"`);
+
+    // 6. Enviar mensaje por WhatsApp
+    const digits = normalizePhone(contactPhone);
+    let chatId = `${digits}@c.us`;
+    try {
+      const numberId = await whatsappClient.getNumberId(digits);
+      if (numberId?._serialized) chatId = numberId._serialized;
+    } catch {}
+
+    const msgResult = await whatsappClient.sendMessage(chatId, replyText);
+    if (msgResult?.id?.id) recentSentIds.add(msgResult.id.id);
+    if (msgResult?.id?._serialized) recentSentIds.add(msgResult.id._serialized);
+
+    // 7. Guardar mensaje en Supabase para el CRM
+    await supabase.from('messages').insert({
+      conversation_id: conversationId,
+      sender_type: 'bot',
+      content_type: 'text',
+      content_text: replyText,
+      message_id: messageId,
+      status: 'sent',
+      ai_generated: true,
+    });
+
+    await supabase
+      .from('conversations')
+      .update({
+        last_message_text: replyText,
+        last_message_at: new Date().toISOString(),
+        ai_reply_count: (conv.ai_reply_count || 0) + 1,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', conversationId);
+
+    console.log(`[WA-Service AI] ✅ Auto-reply enviado con éxito a +${digits}!`);
+  } catch (err) {
+    console.error('[WA-Service AI] Error en handleAiAutoReply:', err.message);
+  }
+}
+
 // ─── Guardar mensaje en Supabase ───────────────────────────────────────────
-async function saveMessageToSupabase({ phone, name, body, mediaUrl, messageId, senderType = 'customer' }) {
+async function saveMessageToSupabase({ phone, name, body, mediaUrl, mediaType, messageId, senderType = 'customer' }) {
   try {
     const cleanPhone = normalizePhone(phone);
+    // Rechazar si el teléfono está vacío, es un grupo o es un broadcast
     if (!cleanPhone) return;
+    if (phone && (phone.includes('@g.us') || phone.includes('broadcast'))) return;
+    // Un ID de grupo normalizado tiene más de 13 dígitos — descartarlo
+    if (cleanPhone.length > 15) return;
 
     // 1. Obtener la config de WhatsApp del CRM
     const { data: config } = await supabase
@@ -257,29 +510,16 @@ async function saveMessageToSupabase({ phone, name, body, mediaUrl, messageId, s
 
     console.log(`[WA-Service] ✅ Mensaje (${senderType}) guardado en conversación ${conversation.id}`);
 
-    // 6. Si es mensaje de cliente, disparar auto-reply de IA
+    // 6. Si es mensaje de cliente, disparar auto-reply de IA local y directo
     if (senderType === 'customer') {
-      const crmUrl = process.env.CRM_URL || 'http://localhost:3000';
-      fetch(`${crmUrl}/api/ai/inbound`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          accountId,
-          conversationId: conversation.id,
-          contactId: contact.id,
-          configOwnerUserId: userId,
-        }),
-      })
-        .then((res) => {
-          if (res.ok) {
-            console.log(`[WA-Service] 🤖 Auto-reply de IA disparado para conv ${conversation.id}`);
-          } else {
-            console.warn(`[WA-Service] AI inbound respondió status ${res.status}`);
-          }
-        })
-        .catch((err) => {
-          console.error('[WA-Service] Error llamando a /api/ai/inbound:', err.message);
-        });
+      handleAiAutoReply({
+        accountId,
+        conversationId: conversation.id,
+        contactId: contact.id,
+        contactPhone: cleanPhone,
+      }).catch((err) => {
+        console.error('[WA-Service AI] Error llamando a handleAiAutoReply:', err.message);
+      });
     }
   } catch (err) {
     console.error('[WA-Service] Error guardando mensaje en Supabase:', err.message);
@@ -296,6 +536,8 @@ async function checkUnreadChats() {
         const chats = Chat.getModelsArray ? Chat.getModelsArray() : [];
         const items = [];
         for (const c of chats.slice(0, 15)) {
+          // Ignorar grupos
+          if (c.id?._serialized?.includes('@g.us')) continue;
           const msgs = c.msgs && c.msgs.getModelsArray ? c.msgs.getModelsArray() : [];
           const last = msgs[msgs.length - 1];
           if (last && !last.id?.fromMe) {
@@ -317,6 +559,12 @@ async function checkUnreadChats() {
     if (Array.isArray(latestList) && latestList.length > 0) {
       for (const item of latestList) {
         if (!item.messageId || recentProcessedIds.has(item.messageId)) continue;
+
+        // Ignorar grupos (segunda barrera)
+        if (item.chatId && item.chatId.includes('@g.us')) continue;
+
+        // Ignorar mensajes anteriores al inicio del servicio (evita importar historial)
+        if (item.timestamp && item.timestamp < readyTimestamp) continue;
 
         // Verificar si ya existe en Supabase
         const { data: existing } = await supabase
@@ -344,7 +592,9 @@ async function checkUnreadChats() {
       }
     }
   } catch (err) {
-    // ignore
+    if (err.message && (err.message.includes('detached Frame') || err.message.includes('Session closed') || err.message.includes('Target closed'))) {
+      restartWhatsApp(err.message);
+    }
   }
 }
 
@@ -401,9 +651,14 @@ function initWhatsApp() {
     console.log(`[WA-Service] 📨 on('message'): fromMe=${msg.fromMe}, from=${msg.from}, to=${msg.to}, timestamp=${msg.timestamp}, body="${msg.body?.slice(0, 30)}"`);
     if (msg.fromMe) return;
     if (msg.from.includes('@g.us')) return;
+    if (msg.from === 'status@broadcast') return;
     if (msg.timestamp && msg.timestamp < readyTimestamp) {
       console.log(`[WA-Service] ⏩ Omitiendo mensaje antiguo (${msg.timestamp} < ${readyTimestamp})`);
       return;
+    }
+    if (msg.id?.id) {
+      if (recentProcessedIds.has(msg.id.id)) return;
+      recentProcessedIds.add(msg.id.id);
     }
 
     let senderPhone = await resolveRealPhone(msg.author || msg.from);
@@ -446,7 +701,9 @@ function initWhatsApp() {
     console.log(`[WA-Service] 📝 on('message_create'): fromMe=${msg.fromMe}, from=${msg.from}, to=${msg.to}, timestamp=${msg.timestamp}, body="${msg.body?.slice(0, 30)}"`);
     if (!msg.fromMe) return;
     if (msg.to && msg.to.includes('@g.us')) return;
+    if (msg.to === 'status@broadcast') return;
     if (msg.timestamp && msg.timestamp < readyTimestamp) return;
+
 
     if (recentSentIds.has(msg.id.id)) {
       recentSentIds.delete(msg.id.id);
@@ -470,9 +727,7 @@ function initWhatsApp() {
   });
 
   whatsappClient.on('disconnected', (reason) => {
-    status = 'initializing';
-    console.log('[WA-Service] Desconectado:', reason, '— reconectando...');
-    setTimeout(() => initWhatsApp(), 5000);
+    restartWhatsApp(`disconnected (${reason})`);
   });
 
   whatsappClient.on('auth_failure', (msg) => {
@@ -481,6 +736,24 @@ function initWhatsApp() {
   });
 
   whatsappClient.initialize();
+}
+
+let isRestarting = false;
+async function restartWhatsApp(reason) {
+  if (isRestarting) return;
+  isRestarting = true;
+  console.log(`[WA-Service] 🔄 Reiniciando WhatsApp Client (Motivo: ${reason})...`);
+  try {
+    if (whatsappClient) {
+      await whatsappClient.destroy().catch(() => {});
+    }
+  } catch (e) {}
+  whatsappClient = null;
+  status = 'initializing';
+  setTimeout(() => {
+    isRestarting = false;
+    initWhatsApp();
+  }, 4000);
 }
 
 // ─── HTTP Server (API para el CRM) ─────────────────────────────────────────
@@ -735,6 +1008,9 @@ const server = http.createServer(async (req, res) => {
 
       } catch (err) {
         console.error('[WA-Service] Error enviando:', err.message);
+        if (err.message && (err.message.includes('detached Frame') || err.message.includes('Session closed') || err.message.includes('Target closed'))) {
+          restartWhatsApp(err.message);
+        }
         if (!res.headersSent) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: err.message }));
