@@ -29,6 +29,7 @@ import {
   AccordionTrigger,
   AccordionContent,
 } from '@/components/ui/accordion';
+import { WhatsAppWebCard } from './whatsapp-web-card';
 import type { WhatsAppConfig as WhatsAppConfigType } from '@/types';
 
 const MASKED_TOKEN = '••••••••••••••••';
@@ -388,11 +389,23 @@ export function WhatsAppConfig() {
   const showResetBanner = resetReason === 'token_corrupted';
 
   return (
-    <section className="animate-in fade-in-50 duration-200">
+    <section className="animate-in fade-in-50 duration-200 space-y-6">
       <SettingsPanelHead
         title={t("title")}
         description={t("description")}
       />
+
+      {/* WhatsApp Web (QR) Multi-Tenant — Opción sin API externa */}
+      <div>
+        <WhatsAppWebCard />
+      </div>
+
+      <div className="pt-2">
+        <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-4">
+          Opciones avanzadas: Meta Cloud API oficial
+        </h3>
+      </div>
+
       <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
       {/* Main config form */}
       <div className="space-y-6">

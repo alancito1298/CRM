@@ -12,6 +12,7 @@ import {
   isUniqueViolation,
   type ExistingContact,
 } from '@/lib/contacts/dedupe';
+import { checkActionAllowed } from '@/lib/saas/plans';
 import {
   Dialog,
   DialogContent,
@@ -162,6 +163,14 @@ export function ContactForm({
           .eq('id', contactId);
         if (error) throw error;
       } else {
+        // Verificar límites de contactos del plan SaaS
+        const limitCheck = await checkActionAllowed(supabase, accountId, 'create_contact');
+        if (!limitCheck.allowed) {
+          toast.error(limitCheck.reason || 'Límite de contactos alcanzado para tu plan actual');
+          setSaving(false);
+          return;
+        }
+
         const { data, error } = await supabase
           .from('contacts')
           .insert({

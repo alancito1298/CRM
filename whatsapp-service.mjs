@@ -1,11 +1,19 @@
 /**
- * WhatsApp Web Sidecar Service
- * 
- * Corre en puerto 3001 junto al CRM (puerto 3000).
- * - Mantiene la sesión de WhatsApp Web con LocalAuth
- * - API REST para enviar mensajes desde el CRM
- * - Recibe mensajes entrantes y los inserta en Supabase
- * 
+ * WhatsApp Web Sidecar Service — Multi-Tenant SaaS Edition
+ *
+ * Maneja múltiples sesiones de WhatsApp Web simultáneas, una por account_id.
+ * Corre en puerto 3001 junto al CRM (Next.js en puerto 3000).
+ *
+ * API REST:
+ *   GET  /                             → dashboard HTML con tabla de sesiones
+ *   GET  /status                        → estado global del servicio (JSON)
+ *   GET  /sessions                      → lista de todas las sesiones (JSON)
+ *   GET  /sessions/:accountId/status    → estado de una sesión específica
+ *   GET  /sessions/:accountId/qr        → página HTML para escanear QR
+ *   POST /sessions/:accountId/start     → iniciar sesión de una cuenta
+ *   POST /sessions/:accountId/stop      → desconectar una cuenta
+ *   POST /sessions/:accountId/send      → enviar mensaje (desde el CRM)
+ *
  * Uso: node whatsapp-service.mjs
  */
 
@@ -20,23 +28,43 @@ dotenv.config({ path: '.env.local' });
 
 const { Client, LocalAuth, MessageMedia } = pkg;
 
-// ─── Config ────────────────────────────────────────────────────────────────
+// ─── Config global ──────────────────────────────────────────────────────────
 const PORT = process.env.WA_SERVICE_PORT || 3001;
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://pjueqfhelyvejyubdkcr.supabase.co';
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBqdWVxZmhlbHl2ZWp5dWJka2NyIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4ODUzOTkwOCwiZXhwIjoyMTA0MTE1OTA4fQ.ygA8b-Ns3pm2vT2yyL7eAA6rOnf24RRTAcJbPPFAVWo';
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'cedc22ba5eec9ef8f35bd3fc445f0f9638ab8514125e0f1b638fca1f7e9302e3';
-const CRM_PHONE = process.env.CRM_PHONE || '+5491154101146'; // Número del CRM
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !ENCRYPTION_KEY) {
+  console.error('[WA-Service] FATAL: Faltan variables de entorno requeridas.');
+  console.error('  Requeridas: NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ENCRYPTION_KEY');
+  process.exit(1);
+}
 
 globalThis.WebSocket = class {};
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-// ─── Estado ────────────────────────────────────────────────────────────────
-let currentQR = null;
-let status = 'initializing'; // initializing | qr | authenticated | ready | error
-let whatsappClient = null;
-let readyTimestamp = 0;
+// ─── Session Manager ──────────────────────────────────────────────────────────
+/**
+ * Mapa central: accountId → SessionState
+ * Cada cuenta tiene su propio estado, cliente Puppeteer, y conjuntos de IDs.
+ */
+const sessions = new Map();
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+function createSessionState(accountId) {
+  return {
+    accountId,
+    client: null,
+    status: 'initializing', // initializing | qr | authenticated | ready | error | stopped
+    qr: null,
+    phone: null,
+    readyTimestamp: Math.floor(Date.now() / 1000) - 120,
+    isRestarting: false,
+    recentSentIds: new Set(),
+    recentProcessedIds: new Set(),
+  };
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function normalizePhone(phone) {
   if (!phone) return '';
   return phone.replace(/^whatsapp:/i, '').replace(/[^0-9]/g, '');
@@ -55,14 +83,6 @@ function getPhoneVariants(phone) {
   }
   return [...new Set(variants)];
 }
-
-function toWAId(phone) {
-  const digits = normalizePhone(phone);
-  return `${digits}@c.us`;
-}
-
-const recentSentIds = new Set();
-const recentProcessedIds = new Set();
 
 function decryptKey(encryptedText) {
   if (!encryptedText) return null;
@@ -88,138 +108,118 @@ function decryptKey(encryptedText) {
     }
     return encryptedText;
   } catch (err) {
-    console.error('[WA-Service] Error desencriptando API key:', err.message);
+    console.error(`[WA] Error desencriptando clave:`, err.message);
     return null;
   }
 }
 
-// ─── Resolver teléfono real a partir de LID o JID ─────────────────────────
-async function resolveRealPhone(waId) {
+function log(accountId, msg) {
+  const tag = accountId ? `[WA][${accountId.slice(0, 8)}]` : '[WA-Service]';
+  console.log(`${tag} ${msg}`);
+}
+
+// ─── Resolver LID → teléfono real ────────────────────────────────────────────
+async function resolveRealPhone(session, waId) {
   if (!waId) return '';
   const clean = normalizePhone(waId);
+  const { client } = session;
 
-  // Si waId es un número normal (@c.us o sin @ con 10-13 dígitos), es teléfono directo
   if ((waId.endsWith('@c.us') || !waId.includes('@')) && clean.length >= 10 && clean.length <= 13) {
     return clean;
   }
 
   const fullId = waId.includes('@') ? waId : `${clean}@lid`;
 
-  // 1. Intentar con getContactLidAndPhone oficial de whatsapp-web.js
   try {
-    if (whatsappClient && typeof whatsappClient.getContactLidAndPhone === 'function') {
-      const res = await whatsappClient.getContactLidAndPhone(fullId);
+    if (client && typeof client.getContactLidAndPhone === 'function') {
+      const res = await client.getContactLidAndPhone(fullId);
       if (Array.isArray(res) && res[0]?.pn) {
         const p = normalizePhone(res[0].pn);
-        if (p) {
-          console.log(`[WA-Service] 🎯 Resuelto LID ${fullId} → Teléfono real: +${p}`);
-          return p;
-        }
+        if (p) return p;
       }
     }
-  } catch (err) {
-    console.warn('[WA-Service] Error en getContactLidAndPhone:', err.message);
-  }
+  } catch {}
 
-  // 2. Intentar buscar en WWebJS / WAWebApiContact vía puppeteer
   try {
-    if (whatsappClient?.pupPage) {
-      const res = await whatsappClient.pupPage.evaluate(async (id) => {
+    if (client?.pupPage) {
+      const res = await client.pupPage.evaluate(async (id) => {
         try {
-          // A: enforceLidAndPnRetrieval
           if (window.WWebJS?.enforceLidAndPnRetrieval) {
             const pair = await window.WWebJS.enforceLidAndPnRetrieval(id);
             if (pair?.phone?._serialized) return pair.phone._serialized;
           }
-
           const WidFactory = window.require('WAWebWidFactory');
           const wid = WidFactory.createWid(id);
-
-          // B: getAlternateUserWid
           const ContactApi = window.require('WAWebApiContact');
           if (ContactApi?.getAlternateUserWid) {
             const alt = ContactApi.getAlternateUserWid(wid);
             if (alt?._serialized) return alt._serialized;
             if (alt?.user) return alt.user;
           }
-
-          // C: Contact Collection
           const ContactCol = window.require('WAWebCollections')?.Contact;
           if (ContactCol) {
             const c = ContactCol.get(wid) || await ContactCol.find(wid);
             if (c?.phoneNumber?._serialized) return c.phoneNumber._serialized;
             if (c?.id && !c.id.isLid()) return c.id._serialized;
           }
-        } catch (e) {
-          return null;
-        }
+        } catch { return null; }
         return null;
       }, fullId);
-
       if (res) {
         const p = normalizePhone(res);
-        if (p) {
-          console.log(`[WA-Service] 🎯 Resuelto vía puppeteer Contact: ${fullId} → +${p}`);
-          return p;
-        }
+        if (p) return p;
       }
     }
-  } catch (err) {
-    console.warn('[WA-Service] Error evaluando en puppeteer:', err.message);
-  }
+  } catch {}
 
   return clean;
 }
 
-// ─── Auto-Reply de Inteligencia Artificial ───────────────────────────────────
-async function handleAiAutoReply({ accountId, conversationId, contactId, contactPhone }) {
+// ─── Auto-Reply de IA (por sesión) ───────────────────────────────────────────
+async function handleAiAutoReply(session, { conversationId, contactPhone }) {
+  const { accountId, client } = session;
   try {
-    // 1. Obtener la config de IA activa para la cuenta
-    const { data: config, error: cfgErr } = await supabase
+    const { data: config } = await supabase
       .from('ai_configs')
       .select('*')
       .eq('account_id', accountId)
       .eq('is_active', true)
       .maybeSingle();
 
-    if (cfgErr || !config) {
-      console.log('[WA-Service AI] No hay ai_configs activa');
-      return;
+    if (!config || !config.auto_reply_enabled) return;
+
+    // Verificar si el plan de la cuenta permite IA auto-reply y tiene cupo de mensajes
+    const { data: sub } = await supabase
+      .from('subscriptions')
+      .select('id, messages_used_this_month, plans(feature_ai_reply, max_messages_per_month)')
+      .eq('account_id', accountId)
+      .maybeSingle();
+
+    if (sub && sub.plans) {
+      if (sub.plans.feature_ai_reply === false) {
+        log(accountId, '⚠️ IA auto-reply no habilitado en el plan de esta cuenta (requiere plan Starter o Pro)');
+        return;
+      }
+      if (sub.plans.max_messages_per_month < 900000 && (sub.messages_used_this_month || 0) >= sub.plans.max_messages_per_month) {
+        log(accountId, '⚠️ Límite mensual de mensajes alcanzado en el plan de esta cuenta');
+        return;
+      }
     }
 
-    if (!config.auto_reply_enabled) {
-      console.log('[WA-Service AI] Auto-reply no está habilitado');
-      return;
-    }
-
-    // 2. Verificar conversación
-    const { data: conv, error: convErr } = await supabase
+    const { data: conv } = await supabase
       .from('conversations')
       .select('id, assigned_agent_id, ai_autoreply_disabled, ai_reply_count')
       .eq('id', conversationId)
       .maybeSingle();
 
-    if (convErr || !conv) return;
-    if (conv.assigned_agent_id) {
-      console.log(`[WA-Service AI] Hay un agente humano asignado en conv ${conversationId} — omitiendo IA`);
-      return;
-    }
+    if (!conv || conv.assigned_agent_id) return;
 
-    // Auto-heal si quedó marcado ai_autoreply_disabled por un handoff previo sin agente asignado
     if (conv.ai_autoreply_disabled) {
-      await supabase
-        .from('conversations')
+      await supabase.from('conversations')
         .update({ ai_autoreply_disabled: false, ai_handoff_summary: null })
         .eq('id', conversationId);
     }
 
-    // El bot nunca deja de contestar mientras no haya un agente humano asignado
-    if (conv.assigned_agent_id) {
-      console.log(`[WA-Service AI] Hay un agente humano asignado en conv ${conversationId} — omitiendo IA`);
-      return;
-    }
-
-    // 3. Obtener últimos mensajes para dar contexto/memoria a la IA (los más recientes primero)
     const { data: rawMsgs } = await supabase
       .from('messages')
       .select('sender_type, content_text, created_at')
@@ -228,227 +228,177 @@ async function handleAiAutoReply({ accountId, conversationId, contactId, contact
       .limit(12);
 
     const recentMsgs = rawMsgs ? rawMsgs.reverse() : [];
-
     const messages = [];
-    if (config.system_prompt) {
-      messages.push({ role: 'system', content: config.system_prompt });
+    if (config.system_prompt) messages.push({ role: 'system', content: config.system_prompt });
+
+    let lastRole = null, lastText = null;
+    for (const m of recentMsgs) {
+      if (!m.content_text) continue;
+      const role = m.sender_type === 'customer' ? 'user' : 'assistant';
+      const trimmed = m.content_text.trim();
+      if (role === lastRole && trimmed === lastText) continue;
+      messages.push({ role, content: trimmed });
+      lastRole = role; lastText = trimmed;
     }
 
-    if (recentMsgs && recentMsgs.length > 0) {
-      let lastRole = null;
-      let lastText = null;
-      for (const m of recentMsgs) {
-        if (!m.content_text) continue;
-        const role = m.sender_type === 'customer' ? 'user' : 'assistant';
-        const trimmed = m.content_text.trim();
-        // Evitar duplicados idénticos consecutivos en el historial
-        if (role === lastRole && trimmed === lastText) continue;
-        messages.push({ role, content: trimmed });
-        lastRole = role;
-        lastText = trimmed;
-      }
-    }
+    while (messages.length > 1 && messages[messages.length - 1].role === 'assistant') messages.pop();
+    if (messages.filter(m => m.role === 'user').length === 0) return;
 
-    // Asegurarse de que el último mensaje sea del cliente para que la IA responda a él
-    while (messages.length > 1 && messages[messages.length - 1].role === 'assistant') {
-      messages.pop();
-    }
-
-    // Verificar que haya al menos un mensaje del usuario
-    if (messages.filter(m => m.role === 'user').length === 0) {
-      return;
-    }
-
-    // 4. Desencriptar API Key
     const apiKey = decryptKey(config.api_key);
-    if (!apiKey) {
-      console.error('[WA-Service AI] Error: No se pudo desencriptar la API key');
-      return;
-    }
+    if (!apiKey) return;
 
-    const modelName = config.model || 'qwen/qwen3.8-27b';
-    console.log(`[WA-Service AI] 🧠 Generando respuesta con ${config.provider} (${modelName})...`);
+    const modelName = config.model || 'llama-3.1-8b-instant';
+    log(accountId, `🧠 IA con ${config.provider} (${modelName})...`);
 
-    // 5. Llamar al proveedor de IA
     let replyText = '';
-    if (config.provider === 'groq') {
-      const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: modelName,
-          messages,
-          max_tokens: 250,
-          temperature: 0.6,
-        }),
-      });
-
-      if (!resp.ok) {
-        const errBody = await resp.text();
-        console.error(`[WA-Service AI] Error HTTP ${resp.status} de Groq:`, errBody);
-      } else {
-        const resJson = await resp.json();
-        replyText = resJson.choices?.[0]?.message?.content?.trim() || '';
+    try {
+      if (config.provider === 'groq') {
+        const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+          body: JSON.stringify({ model: modelName, messages, max_tokens: 250, temperature: 0.6 }),
+        });
+        if (resp.ok) replyText = (await resp.json()).choices?.[0]?.message?.content?.trim() || '';
+      } else if (config.provider === 'openai') {
+        const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+          body: JSON.stringify({ model: modelName, messages, max_tokens: 450, temperature: 0.7 }),
+        });
+        if (resp.ok) replyText = (await resp.json()).choices?.[0]?.message?.content?.trim() || '';
+      } else if (config.provider === 'anthropic') {
+        const systemMsg = messages.find(m => m.role === 'system')?.content || '';
+        const chatMsgs = messages.filter(m => m.role !== 'system');
+        const resp = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({ model: modelName, system: systemMsg, messages: chatMsgs, max_tokens: 450 }),
+        });
+        if (resp.ok) replyText = (await resp.json()).content?.[0]?.text?.trim() || '';
       }
-    } else if (config.provider === 'openai') {
-      const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: modelName,
-          messages,
-          max_tokens: 450,
-          temperature: 0.7,
-        }),
-      });
-
-      if (!resp.ok) {
-        console.error('[WA-Service AI] Error HTTP de OpenAI:', resp.status, await resp.text());
-      } else {
-        const resJson = await resp.json();
-        replyText = resJson.choices?.[0]?.message?.content?.trim() || '';
-      }
-    } else if (config.provider === 'anthropic') {
-      const systemMsg = messages.find(m => m.role === 'system')?.content || '';
-      const userAndAssistantMsgs = messages.filter(m => m.role !== 'system');
-      const resp = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: modelName,
-          system: systemMsg,
-          messages: userAndAssistantMsgs,
-          max_tokens: 450,
-        }),
-      });
-
-      if (!resp.ok) {
-        console.error('[WA-Service AI] Error HTTP de Anthropic:', resp.status, await resp.text());
-      } else {
-        const resJson = await resp.json();
-        replyText = resJson.content?.[0]?.text?.trim() || '';
-      }
+    } catch (err) {
+      console.error(`[WA][${accountId.slice(0, 8)}] Error llamando a IA:`, err.message);
     }
 
     if (!replyText) {
-      console.warn('[WA-Service AI] Activando respuesta de respaldo con especialista...');
-      replyText = 'Para brindarte una información más acertada y detallada sobre tu consulta, una persona especializada en el tema se pondrá en contacto contigo por este mismo chat a la brevedad. ¿A qué rubro se dedica tu negocio?';
+      replyText = 'Para brindarte una información más acertada, una persona especializada se pondrá en contacto contigo por este mismo chat a la brevedad. 😊';
     }
 
-    console.log(`[WA-Service AI] 💬 Respuesta generada: "${replyText}"`);
+    log(accountId, `💬 "${replyText.slice(0, 60)}..."`);
 
-    // 6. Enviar mensaje por WhatsApp
     const digits = normalizePhone(contactPhone);
     let chatId = `${digits}@c.us`;
     try {
-      const numberId = await whatsappClient.getNumberId(digits);
+      const numberId = await client.getNumberId(digits);
       if (numberId?._serialized) chatId = numberId._serialized;
     } catch {}
 
-    const msgResult = await whatsappClient.sendMessage(chatId, replyText);
-    if (msgResult?.id?.id) recentSentIds.add(msgResult.id.id);
-    if (msgResult?.id?._serialized) recentSentIds.add(msgResult.id._serialized);
+    const msgResult = await client.sendMessage(chatId, replyText);
+    if (msgResult?.id?.id) session.recentSentIds.add(msgResult.id.id);
+    if (msgResult?.id?._serialized) session.recentSentIds.add(msgResult.id._serialized);
 
-    // 7. Guardar mensaje en Supabase para el CRM
     await supabase.from('messages').insert({
       conversation_id: conversationId,
       sender_type: 'bot',
       content_type: 'text',
       content_text: replyText,
-      message_id: messageId,
       status: 'sent',
       ai_generated: true,
     });
 
-    await supabase
-      .from('conversations')
-      .update({
-        last_message_text: replyText,
-        last_message_at: new Date().toISOString(),
-        ai_reply_count: (conv.ai_reply_count || 0) + 1,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', conversationId);
+    await supabase.from('conversations').update({
+      last_message_text: replyText,
+      last_message_at: new Date().toISOString(),
+      ai_reply_count: (conv.ai_reply_count || 0) + 1,
+      updated_at: new Date().toISOString(),
+    }).eq('id', conversationId);
 
-    console.log(`[WA-Service AI] ✅ Auto-reply enviado con éxito a +${digits}!`);
+    // Incrementar contador de mensajes usados en el mes para el SaaS
+    if (sub?.id) {
+      await supabase
+        .from('subscriptions')
+        .update({
+          messages_used_this_month: (sub.messages_used_this_month || 0) + 1,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', sub.id);
+    }
+
+    log(accountId, `✅ Auto-reply enviado a +${digits}`);
   } catch (err) {
-    console.error('[WA-Service AI] Error en handleAiAutoReply:', err.message);
+    console.error(`[WA][${accountId.slice(0, 8)}] Error en auto-reply:`, err.message);
   }
 }
 
-// ─── Guardar mensaje en Supabase ───────────────────────────────────────────
-async function saveMessageToSupabase({ phone, name, body, mediaUrl, mediaType, messageId, senderType = 'customer' }) {
+// ─── Guardar mensaje en Supabase (por sesión) ─────────────────────────────────
+async function saveMessage(session, { phone, name, body, mediaUrl, messageId, senderType = 'customer', avatarUrl = null, createdAt = null }) {
+  const { accountId } = session;
   try {
     const cleanPhone = normalizePhone(phone);
-    // Rechazar si el teléfono está vacío, es un grupo o es un broadcast
-    if (!cleanPhone) return;
-    if (phone && (phone.includes('@g.us') || phone.includes('broadcast'))) return;
-    // Un ID de grupo normalizado tiene más de 13 dígitos — descartarlo
-    if (cleanPhone.length > 15) return;
+    if (!cleanPhone || cleanPhone.length > 15) return null;
+    if (phone?.includes('@g.us') || phone?.includes('broadcast')) return null;
 
-    // 1. Obtener la config de WhatsApp del CRM
-    const { data: config } = await supabase
+    // Obtener user_id del owner de la cuenta para asignarlo en nuevas filas
+    const { data: waConfig } = await supabase
       .from('whatsapp_config')
-      .select('*')
-      .eq('status', 'connected')
-      .single();
+      .select('user_id')
+      .eq('account_id', accountId)
+      .maybeSingle();
+    let userId = waConfig?.user_id || null;
 
-    if (!config) {
-      console.error('[WA-Service] No hay whatsapp_config activa en DB');
-      return;
+    if (!userId) {
+      const { data: prof } = await supabase
+        .from('profiles')
+        .select('user_id')
+        .eq('account_id', accountId)
+        .limit(1)
+        .maybeSingle();
+      userId = prof?.user_id || null;
     }
 
-    const accountId = config.account_id;
-    const userId = config.user_id;
-
-    // 2. Buscar o crear contacto usando variantes de teléfono
+    // Buscar o crear contacto
     const variants = getPhoneVariants(cleanPhone);
     let { data: contact } = await supabase
       .from('contacts')
-      .select('id, name, phone')
+      .select('id, name, phone, avatar_url')
       .eq('account_id', accountId)
       .in('phone', variants)
       .limit(1)
       .maybeSingle();
 
     if (!contact) {
-      const displayPhone = `+${cleanPhone}`;
-      const displayName = name || displayPhone;
-      const { data: newContact, error: contactErr } = await supabase
+      const { data: newContact, error } = await supabase
         .from('contacts')
         .insert({
           account_id: accountId,
           user_id: userId,
-          phone: displayPhone,
-          name: displayName,
+          phone: `+${cleanPhone}`,
+          name: name || `+${cleanPhone}`,
+          avatar_url: avatarUrl || null,
         })
         .select()
         .single();
-
-      if (contactErr) {
-        console.error('[WA-Service] Error creando contacto:', contactErr.message);
-        return;
-      }
+      if (error) { console.error(`[WA][${accountId.slice(0, 8)}] Error contacto:`, error.message); return null; }
       contact = newContact;
-      console.log(`[WA-Service] Nuevo contacto creado: ${contact.phone} (${contact.name})`);
-    } else if (name && contact.name === contact.phone && name !== contact.phone) {
-      await supabase.from('contacts').update({ name }).eq('id', contact.id);
+      log(accountId, `Nuevo contacto: ${contact.phone}${avatarUrl ? ' (con foto)' : ''}`);
+    } else {
+      const updates = {};
+      if (name && (contact.name === contact.phone || !contact.name) && name !== contact.phone) {
+        updates.name = name;
+      }
+      if (avatarUrl && (!contact.avatar_url || contact.avatar_url !== avatarUrl)) {
+        updates.avatar_url = avatarUrl;
+      }
+      if (Object.keys(updates).length > 0) {
+        await supabase.from('contacts').update(updates).eq('id', contact.id);
+      }
     }
 
-    // 3. Buscar o crear conversación
+    // Buscar o crear conversación
+    const timestamp = createdAt || new Date().toISOString();
     let { data: conversation } = await supabase
       .from('conversations')
-      .select('id')
+      .select('id, last_message_at')
       .eq('account_id', accountId)
       .eq('contact_id', contact.id)
       .eq('status', 'open')
@@ -457,468 +407,550 @@ async function saveMessageToSupabase({ phone, name, body, mediaUrl, mediaType, m
       .maybeSingle();
 
     if (!conversation) {
-      const { data: newConv, error: convErr } = await supabase
+      const { data: newConv, error } = await supabase
         .from('conversations')
         .insert({
           account_id: accountId,
           user_id: userId,
           contact_id: contact.id,
           status: 'open',
-          last_message_at: new Date().toISOString(),
+          last_message_at: timestamp,
           last_message_text: body?.slice(0, 255) || '',
           unread_count: senderType === 'customer' ? 1 : 0,
         })
         .select()
         .single();
-
-      if (convErr) {
-        console.error('[WA-Service] Error creando conversación:', convErr.message);
-        return;
-      }
+      if (error) { console.error(`[WA][${accountId.slice(0, 8)}] Error conversación:`, error.message); return null; }
       conversation = newConv;
-      console.log(`[WA-Service] Nueva conversación: ${conversation.id}`);
+      log(accountId, `Nueva conversación: ${conversation.id}`);
     }
 
-    // 4. Insertar mensaje en messages
+    // Deduplicación: no insertar si el message_id ya existe
+    const finalMsgId = messageId || `wa-${Date.now()}`;
+    if (messageId) {
+      const { data: existingMsg } = await supabase
+        .from('messages')
+        .select('id')
+        .eq('conversation_id', conversation.id)
+        .eq('message_id', finalMsgId)
+        .maybeSingle();
+      if (existingMsg) {
+        return { contact, conversation, alreadyExists: true };
+      }
+    }
+
+    // Insertar mensaje
     const contentText = body || (mediaUrl ? '[Archivo multimedia]' : '');
-    const { error: msgErr } = await supabase
-      .from('messages')
-      .insert({
-        conversation_id: conversation.id,
-        sender_type: senderType,
-        sender_id: senderType === 'customer' ? contact.id : null,
-        content_type: mediaUrl ? 'media' : 'text',
-        content_text: contentText,
-        media_url: mediaUrl || null,
-        status: senderType === 'customer' ? 'delivered' : 'sent',
-        message_id: messageId || `wa-${Date.now()}`,
-      });
+    const { error: msgErr } = await supabase.from('messages').insert({
+      conversation_id: conversation.id,
+      sender_type: senderType,
+      sender_id: senderType === 'customer' ? contact.id : null,
+      content_type: mediaUrl ? 'media' : 'text',
+      content_text: contentText,
+      media_url: mediaUrl || null,
+      status: senderType === 'customer' ? 'delivered' : 'sent',
+      message_id: finalMsgId,
+      created_at: timestamp,
+    });
+    if (msgErr) { console.error(`[WA][${accountId.slice(0, 8)}] Error mensaje:`, msgErr.message); return null; }
 
-    if (msgErr) {
-      console.error('[WA-Service] Error insertando mensaje:', msgErr.message);
-      return;
-    }
-
-    // 5. Actualizar conversación con último mensaje
-    await supabase
-      .from('conversations')
-      .update({
-        last_message_at: new Date().toISOString(),
+    // Actualizar last_message_at sólo si este mensaje es más reciente
+    if (!conversation.last_message_at || new Date(timestamp) >= new Date(conversation.last_message_at)) {
+      await supabase.from('conversations').update({
+        last_message_at: timestamp,
         last_message_text: contentText.slice(0, 255),
-      })
-      .eq('id', conversation.id);
-
-    console.log(`[WA-Service] ✅ Mensaje (${senderType}) guardado en conversación ${conversation.id}`);
-
-    // 6. Si es mensaje de cliente, disparar auto-reply de IA local y directo
-    if (senderType === 'customer') {
-      handleAiAutoReply({
-        accountId,
-        conversationId: conversation.id,
-        contactId: contact.id,
-        contactPhone: cleanPhone,
-      }).catch((err) => {
-        console.error('[WA-Service AI] Error llamando a handleAiAutoReply:', err.message);
-      });
+      }).eq('id', conversation.id);
     }
+
+    log(accountId, `✅ Mensaje (${senderType}) en conv ${conversation.id}`);
+    return { contact, conversation };
   } catch (err) {
-    console.error('[WA-Service] Error guardando mensaje en Supabase:', err.message);
+    console.error(`[WA][${accountId.slice(0, 8)}] Error guardando mensaje:`, err.message);
+    return null;
   }
 }
 
-// ─── Polling de respaldo para mensajes recientes en WhatsApp Web ───────────
-async function checkUnreadChats() {
-  if (!whatsappClient?.pupPage) return;
+// ─── Sincronizar chats recientes y fotos de perfil ───────────────────────────
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function syncRecentChats(session, maxChats = 50, msgsPerChat = 50) {
+  const { accountId, client } = session;
+  if (!client) return { syncedChats: 0, syncedMessages: 0 };
+  log(accountId, `🔄 Iniciando sincronización de ${maxChats} chats recientes con historial y fotos...`);
+
+  // whatsapp-web.js puede rechazar getChats() si el cliente aún no está
+  // completamente listo internamente. Reintentar hasta 3 veces.
+  let chats = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await sleep(attempt === 1 ? 3000 : 5000);
+      chats = await client.getChats();
+      break;
+    } catch (e) {
+      console.error(`[WA][${accountId.slice(0, 8)}] getChats intento ${attempt}/3 fallido:`, e?.message || e);
+      if (attempt === 3) return { error: `getChats falló después de 3 intentos: ${e?.message || e}` };
+    }
+  }
+
   try {
-    const latestList = await whatsappClient.pupPage.evaluate(() => {
+    log(accountId, `Total chats en WhatsApp: ${chats.length}`);
+
+    const eligibleChats = chats
+      .filter(c => !c.id?._serialized?.includes('status@broadcast') && !c.isGroup)
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+      .slice(0, maxChats);
+
+    let totalSyncedChats = 0;
+    let totalSyncedMsgs = 0;
+
+    for (const chat of eligibleChats) {
+      try {
+        const rawPhone = chat.id?.user || chat.id?._serialized?.split('@')[0];
+        const phone = normalizePhone(rawPhone);
+        if (!phone) continue;
+
+        // Nombre del contacto
+        let name = chat.name || chat.formattedTitle;
+        if (!name || name === rawPhone || name === phone) {
+          try {
+            const c = await chat.getContact();
+            name = c?.pushname || c?.name || null;
+          } catch {}
+        }
+        if (!name) name = `+${phone}`;
+
+        // Foto de perfil del contacto
+        let avatarUrl = null;
+        try {
+          avatarUrl = await client.getProfilePicUrl(chat.id._serialized);
+        } catch {}
+
+        // Mensajes históricos del chat
+        let messages = [];
+        try {
+          messages = await chat.fetchMessages({ limit: msgsPerChat });
+        } catch {}
+
+        if ((!messages || messages.length === 0) && chat.lastMessage) {
+          messages = [chat.lastMessage];
+        }
+
+        if (messages && messages.length > 0) {
+          messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+          for (const msg of messages) {
+            if (!msg.body && !msg.hasMedia) continue;
+            const senderType = msg.fromMe ? 'agent' : 'customer';
+            const msgBody = msg.body || (msg.hasMedia ? `[${msg.type || 'Archivo multimedia'}]` : '');
+            const msgTimestamp = msg.timestamp
+              ? new Date(msg.timestamp * 1000).toISOString()
+              : new Date().toISOString();
+            const msgId = msg.id?.id || msg.id?._serialized || `wa-hist-${msg.timestamp}-${phone}`;
+
+            const res = await saveMessage(session, {
+              phone,
+              name,
+              body: msgBody,
+              mediaUrl: null,
+              messageId: msgId,
+              senderType,
+              avatarUrl,
+              createdAt: msgTimestamp,
+            });
+
+            if (res && !res.alreadyExists) totalSyncedMsgs++;
+          }
+        } else {
+          // Si no hay mensajes, al menos creamos el contacto con foto
+          await saveMessage(session, {
+            phone,
+            name,
+            body: '',
+            messageId: null,
+            senderType: 'customer',
+            avatarUrl,
+            createdAt: new Date().toISOString(),
+          });
+        }
+
+        totalSyncedChats++;
+      } catch (chatError) {
+        console.error(`[WA][${accountId.slice(0, 8)}] Error en chat individual:`, chatError.message);
+      }
+    }
+
+    log(accountId, `✅ Sync completado: ${totalSyncedChats} contactos, ${totalSyncedMsgs} mensajes nuevos.`);
+    return { syncedChats: totalSyncedChats, syncedMessages: totalSyncedMsgs };
+  } catch (err) {
+    console.error(`[WA][${accountId.slice(0, 8)}] Error general en syncRecentChats:`, err.message);
+    return { error: err.message };
+  }
+}
+
+// ─── Polling de respaldo ───────────────────────────────────────────────────────
+async function checkUnreadChats(session) {
+  if (!session.client?.pupPage) return;
+  try {
+    const items = await session.client.pupPage.evaluate(() => {
       try {
         const { Chat } = window.require('WAWebCollections');
         const chats = Chat.getModelsArray ? Chat.getModelsArray() : [];
-        const items = [];
-        for (const c of chats.slice(0, 15)) {
-          // Ignorar grupos
-          if (c.id?._serialized?.includes('@g.us')) continue;
-          const msgs = c.msgs && c.msgs.getModelsArray ? c.msgs.getModelsArray() : [];
-          const last = msgs[msgs.length - 1];
-          if (last && !last.id?.fromMe) {
-            items.push({
-              chatId: c.id?._serialized,
-              name: c.name || c.formattedTitle || '',
-              body: last.body || '',
-              messageId: last.id?._serialized || last.id?.id || '',
-              timestamp: last.t,
-            });
-          }
-        }
-        return items;
-      } catch {
-        return [];
-      }
+        return chats.slice(0, 15)
+          .filter(c => !c.id?._serialized?.includes('@g.us'))
+          .map(c => {
+            const msgs = c.msgs?.getModelsArray?.() || [];
+            const last = msgs[msgs.length - 1];
+            if (!last || last.id?.fromMe) return null;
+            return { chatId: c.id?._serialized, name: c.name || '', body: last.body || '', messageId: last.id?._serialized || last.id?.id || '', timestamp: last.t };
+          })
+          .filter(Boolean);
+      } catch { return []; }
     });
 
-    if (Array.isArray(latestList) && latestList.length > 0) {
-      for (const item of latestList) {
-        if (!item.messageId || recentProcessedIds.has(item.messageId)) continue;
+    for (const item of (items || [])) {
+      if (!item.messageId || session.recentProcessedIds.has(item.messageId)) continue;
+      if (item.chatId?.includes('@g.us')) continue;
+      if (item.timestamp && item.timestamp < session.readyTimestamp) continue;
 
-        // Ignorar grupos (segunda barrera)
-        if (item.chatId && item.chatId.includes('@g.us')) continue;
+      const { data: exists } = await supabase.from('messages').select('id').eq('message_id', item.messageId).maybeSingle();
+      if (exists) { session.recentProcessedIds.add(item.messageId); continue; }
 
-        // Ignorar mensajes anteriores al inicio del servicio (evita importar historial)
-        if (item.timestamp && item.timestamp < readyTimestamp) continue;
+      session.recentProcessedIds.add(item.messageId);
+      const phone = await resolveRealPhone(session, item.chatId);
+      log(session.accountId, `📬 Detectado de +${phone}: "${item.body?.slice(0, 40)}"`);
 
-        // Verificar si ya existe en Supabase
-        const { data: existing } = await supabase
-          .from('messages')
-          .select('id')
-          .eq('message_id', item.messageId)
-          .maybeSingle();
-
-        if (existing) {
-          recentProcessedIds.add(item.messageId);
-          continue;
-        }
-
-        recentProcessedIds.add(item.messageId);
-        let senderPhone = await resolveRealPhone(item.chatId);
-        console.log(`[WA-Service] 📬 Mensaje entrante detectado de +${senderPhone}: "${item.body}"`);
-
-        await saveMessageToSupabase({
-          phone: senderPhone,
-          name: item.name,
-          body: item.body,
-          messageId: item.messageId,
-          senderType: 'customer',
-        });
+      const result = await saveMessage(session, { phone, name: item.name, body: item.body, messageId: item.messageId });
+      if (result) {
+        handleAiAutoReply(session, { conversationId: result.conversation.id, contactPhone: phone }).catch(() => {});
       }
     }
   } catch (err) {
-    if (err.message && (err.message.includes('detached Frame') || err.message.includes('Session closed') || err.message.includes('Target closed'))) {
-      restartWhatsApp(err.message);
+    if (err.message?.match(/detached Frame|Session closed|Target closed/)) {
+      restartSession(session, err.message);
     }
   }
 }
 
-// ─── WhatsApp Web Client ────────────────────────────────────────────────────
-function initWhatsApp() {
-  setInterval(checkUnreadChats, 2500);
-  whatsappClient = new Client({
-    authStrategy: new LocalAuth({ clientId: 'crm-production' }),
-    puppeteer: {
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    },
-  });
-
-  whatsappClient.on('qr', (qr) => {
-    currentQR = qr;
-    status = 'qr';
-    console.log('[WA-Service] QR generado → abrí http://localhost:3001 para escanear');
-  });
-
-  whatsappClient.on('authenticated', () => {
-    status = 'authenticated';
-    currentQR = null;
-    console.log('[WA-Service] ✅ Autenticado');
-  });
-
-  // Cerrar periódicamente cualquier modal/popup de WhatsApp Web (ej: "What's new")
+// ─── Cerrar modales emergentes de WhatsApp Web ────────────────────────────────
+function startModalDismisser(session) {
   setInterval(async () => {
     try {
-      if (whatsappClient?.pupPage) {
-        await whatsappClient.pupPage.evaluate(() => {
+      if (session.client?.pupPage) {
+        await session.client.pupPage.evaluate(() => {
           const dialog = document.querySelector('div[role="dialog"]');
-          if (dialog) {
-            const btn = dialog.querySelector('[aria-label="Close"]') ||
-                        dialog.querySelector('[data-icon="x"]')?.closest('button') ||
-                        dialog.querySelector('button[aria-label="Cerrar"]') ||
-                        dialog.querySelector('button');
-            if (btn) btn.click();
-          }
-        });
-      }
-    } catch {}
-  }, 2000);
-
-  readyTimestamp = Math.floor(Date.now() / 1000) - 120; // 2 min margin
-
-  whatsappClient.on('ready', () => {
-    status = 'ready';
-    readyTimestamp = Math.floor(Date.now() / 1000) - 120;
-    console.log('[WA-Service] ✅ WhatsApp listo para enviar y recibir mensajes');
-  });
-
-  whatsappClient.on('message', async (msg) => {
-    console.log(`[WA-Service] 📨 on('message'): fromMe=${msg.fromMe}, from=${msg.from}, to=${msg.to}, timestamp=${msg.timestamp}, body="${msg.body?.slice(0, 30)}"`);
-    if (msg.fromMe) return;
-    if (msg.from.includes('@g.us')) return;
-    if (msg.from === 'status@broadcast') return;
-    if (msg.timestamp && msg.timestamp < readyTimestamp) {
-      console.log(`[WA-Service] ⏩ Omitiendo mensaje antiguo (${msg.timestamp} < ${readyTimestamp})`);
-      return;
-    }
-    if (msg.id?.id) {
-      if (recentProcessedIds.has(msg.id.id)) return;
-      recentProcessedIds.add(msg.id.id);
-    }
-
-    let senderPhone = await resolveRealPhone(msg.author || msg.from);
-    let senderName = null;
-    try {
-      const waContact = await msg.getContact();
-      if (waContact?.pushname || waContact?.name) {
-        senderName = waContact.pushname || waContact.name;
-      }
-    } catch (e) {
-      console.warn('[WA-Service] getContact error:', e.message);
-    }
-
-    let mediaUrl = null;
-    let mediaType = null;
-    if (msg.hasMedia) {
-      try {
-        const media = await msg.downloadMedia();
-        mediaType = media.mimetype;
-      } catch (e) {
-        console.error('[WA-Service] Error descargando media:', e.message);
-      }
-    }
-
-    console.log(`[WA-Service] Mensaje entrante de +${senderPhone} (${senderName || 'sin nombre'}): "${msg.body?.slice(0, 50)}"`);
-
-    await saveMessageToSupabase({
-      phone: senderPhone,
-      name: senderName,
-      body: msg.body,
-      mediaUrl,
-      mediaType,
-      messageId: msg.id.id,
-      senderType: 'customer',
-    });
-  });
-
-  // Sincronizar mensajes enviados directamente desde la app de WhatsApp del celular
-  whatsappClient.on('message_create', async (msg) => {
-    console.log(`[WA-Service] 📝 on('message_create'): fromMe=${msg.fromMe}, from=${msg.from}, to=${msg.to}, timestamp=${msg.timestamp}, body="${msg.body?.slice(0, 30)}"`);
-    if (!msg.fromMe) return;
-    if (msg.to && msg.to.includes('@g.us')) return;
-    if (msg.to === 'status@broadcast') return;
-    if (msg.timestamp && msg.timestamp < readyTimestamp) return;
-
-
-    if (recentSentIds.has(msg.id.id)) {
-      recentSentIds.delete(msg.id.id);
-      return;
-    }
-
-    let targetPhone = await resolveRealPhone(msg.to);
-    let targetName = null;
-    try {
-      const waContact = await msg.getContact();
-      if (waContact?.pushname || waContact?.name) targetName = waContact.pushname || waContact.name;
-    } catch {}
-
-    await saveMessageToSupabase({
-      phone: targetPhone,
-      name: targetName,
-      body: msg.body,
-      messageId: msg.id.id,
-      senderType: 'agent',
-    });
-  });
-
-  whatsappClient.on('disconnected', (reason) => {
-    restartWhatsApp(`disconnected (${reason})`);
-  });
-
-  whatsappClient.on('auth_failure', (msg) => {
-    status = 'error';
-    console.error('[WA-Service] Error de autenticación:', msg);
-  });
-
-  whatsappClient.initialize();
-}
-
-let isRestarting = false;
-async function restartWhatsApp(reason) {
-  if (isRestarting) return;
-  isRestarting = true;
-  console.log(`[WA-Service] 🔄 Reiniciando WhatsApp Client (Motivo: ${reason})...`);
-  try {
-    if (whatsappClient) {
-      await whatsappClient.destroy().catch(() => {});
-    }
-  } catch (e) {}
-  whatsappClient = null;
-  status = 'initializing';
-  setTimeout(() => {
-    isRestarting = false;
-    initWhatsApp();
-  }, 4000);
-}
-
-// ─── HTTP Server (API para el CRM) ─────────────────────────────────────────
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-
-  // CORS para Next.js en localhost:3000
-  res.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  // GET /status — estado de la conexión
-  if (req.method === 'GET' && url.pathname === '/status') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    const realPhone = whatsappClient?.info?.wid?.user ? `+${whatsappClient.info.wid.user}` : CRM_PHONE;
-    const isConnected = status === 'ready' || status === 'authenticated' || !!whatsappClient?.info?.wid;
-    res.end(JSON.stringify({ status: isConnected ? 'ready' : status, phone: realPhone, info: whatsappClient?.info || null }));
-    return;
-  }
-
-  // GET /resolve?id=... — probar resolución de LID a teléfono
-  if (req.method === 'GET' && url.pathname === '/resolve') {
-    const id = url.searchParams.get('id');
-    const resolved = await resolveRealPhone(id);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ id, resolved, phone: `+${resolved}` }));
-    return;
-  }
-
-  // GET /debug — depuración de WhatsApp Web
-  if (req.method === 'GET' && url.pathname === '/debug') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    try {
-      const debugInfo = await whatsappClient?.pupPage?.evaluate(() => {
-        return {
-          hasWWebJS: typeof window.WWebJS !== 'undefined',
-          hasOnAddMessageEvent: typeof window.onAddMessageEvent === 'function',
-          hasOnMessage: typeof window.onMessage === 'function',
-          title: document.title,
-          url: window.location.href,
-        };
-      }) || null;
-      res.end(JSON.stringify({ status, readyTimestamp, debugInfo }));
-    } catch (e) {
-      res.end(JSON.stringify({ status, readyTimestamp, error: e.message }));
-    }
-    return;
-  }
-
-  // GET /test-check — probar lectura directa de chats
-  if (req.method === 'GET' && url.pathname === '/test-check') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    try {
-      const data = await whatsappClient?.pupPage?.evaluate(() => {
-        try {
-          const res = {};
-          res.hasRequire = typeof window.require === 'function';
-          if (res.hasRequire) {
-            try {
-              const { ChatCollection } = window.require('WAWebChatCollection');
-              res.chatCollectionFound = !!ChatCollection;
-              res.chatCount = ChatCollection?.models?.length;
-              if (ChatCollection?.models?.length > 0) {
-                res.sampleChats = ChatCollection.models.slice(0, 3).map(c => ({
-                  id: c.id?._serialized,
-                  name: c.name || c.formattedTitle,
-                  unread: c.unreadCount,
-                  msgsLen: c.msgs?.models?.length,
-                  lastMsg: c.msgs?.models?.[c.msgs.models.length - 1]?.body,
-                  lastFromMe: c.msgs?.models?.[c.msgs.models.length - 1]?.id?.fromMe,
-                }));
-              }
-            } catch (e) {
-              res.chatColError = e.message;
-            }
-
-            try {
-              const { Msg } = window.require('WAWebCollections');
-              res.msgCount = Msg?.models?.length;
-            } catch (e) {
-              res.msgError = e.message;
-            }
-          }
-          return res;
-        } catch (err) {
-          return { error: err.message };
-        }
-      }) || null;
-      res.end(JSON.stringify(data));
-    } catch (e) {
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // GET /dismiss — cerrar modales emergentes
-  if (req.method === 'GET' && url.pathname === '/dismiss') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    try {
-      const dismissed = await whatsappClient?.pupPage?.evaluate(() => {
-        const dialog = document.querySelector('div[role="dialog"]');
-        if (dialog) {
+          if (!dialog) return;
           const btn = dialog.querySelector('[aria-label="Close"]') ||
                       dialog.querySelector('[data-icon="x"]')?.closest('button') ||
                       dialog.querySelector('button[aria-label="Cerrar"]') ||
                       dialog.querySelector('button');
-          if (btn) {
-            btn.click();
-            return { closed: true, text: btn.innerText || btn.getAttribute('aria-label') };
-          }
-        }
-        return { closed: false };
-      });
-      await whatsappClient?.pupPage?.keyboard?.press('Escape');
-      res.end(JSON.stringify({ dismissed }));
-    } catch (e) {
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // GET /screenshot — captura de pantalla de WhatsApp Web
-  if (req.method === 'GET' && url.pathname === '/screenshot') {
-    try {
-      const buffer = await whatsappClient?.pupPage?.screenshot();
-      if (buffer) {
-        res.writeHead(200, { 'Content-Type': 'image/png' });
-        res.end(buffer);
-        return;
+          if (btn) btn.click();
+        });
       }
-      res.writeHead(500, { 'Content-Type': 'text/plain' });
-      res.end('No pupPage available');
-    } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'text/plain' });
-      res.end('Error taking screenshot: ' + e.message);
+    } catch {}
+  }, 3000);
+}
+
+// ─── Iniciar sesión para una cuenta ───────────────────────────────────────────
+function initSession(accountId) {
+  // Si ya hay una sesión corriendo o en proceso, no duplicar
+  if (sessions.has(accountId)) {
+    const existing = sessions.get(accountId);
+    if (existing.status === 'ready') {
+      log(accountId, 'Sesión ya está lista, omitiendo init');
+      return existing;
     }
-    return;
+    if (existing.status === 'initializing' || existing.status === 'qr') {
+      log(accountId, `Sesión ya en proceso (${existing.status}), omitiendo duplicado`);
+      return existing;
+    }
+    // Si estaba en estado previo (error, stopped), limpiamos antes de recrear
+    if (existing.client) {
+      try { existing.client.destroy().catch(() => {}); } catch {}
+      existing.client = null;
+    }
   }
 
-  // GET /qr — página con el QR para escanear
-  if (req.method === 'GET' && url.pathname === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  const session = createSessionState(accountId);
+  sessions.set(accountId, session);
+  log(accountId, '🚀 Iniciando sesión...');
 
-    const qrImg = currentQR
-      ? await qrcode.toDataURL(currentQR, { width: 280, margin: 2 })
-      : null;
+  const client = new Client({
+    authStrategy: new LocalAuth({ clientId: `saas-${accountId}` }),
+    webVersionCache: {
+      type: 'remote',
+      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1023054178-alpha.html',
+    },
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--window-size=1280,800',
+      ],
+    },
+  });
+  session.client = client;
 
-    res.end(`<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>WhatsApp CRM</title>
+  client.on('qr', (qr) => {
+    session.qr = qr;
+    session.status = 'qr';
+    log(accountId, `QR listo → GET /sessions/${accountId}/qr`);
+    supabase.from('whatsapp_config').update({ status: 'qr', updated_at: new Date().toISOString() }).eq('account_id', accountId).then(() => {});
+  });
+
+  client.on('authenticated', () => {
+    session.status = 'authenticated';
+    session.qr = null;
+    log(accountId, '✅ Autenticado');
+
+    // Arrancar modal-dismisser ANTES del ready para desbloquear pantallas intermedias
+    startModalDismisser(session);
+
+    // Watchdog: si no llegamos a 'ready' en 90s, reiniciar sesión
+    const watchdog = setTimeout(() => {
+      if (session.status !== 'ready') {
+        log(accountId, '⚠️ Watchdog: sesión atascada en authenticated, reiniciando...');
+        restartSession(session, 'watchdog_stuck_authenticated');
+      }
+    }, 90_000);
+    session._authWatchdog = watchdog;
+  });
+
+  client.on('ready', async () => {
+    session.status = 'ready';
+    session.readyTimestamp = Math.floor(Date.now() / 1000) - 120;
+    session.phone = client.info?.wid?.user ? `+${client.info.wid.user}` : null;
+    log(accountId, `✅ Listo — Teléfono: ${session.phone}`);
+
+    try {
+      const { data: existing } = await supabase
+        .from('whatsapp_config')
+        .select('id')
+        .eq('account_id', accountId)
+        .maybeSingle();
+
+      if (existing) {
+        await supabase
+          .from('whatsapp_config')
+          .update({
+            status: 'connected',
+            phone_number_id: session.phone || 'whatsapp_web',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('account_id', accountId);
+      } else {
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('user_id')
+          .eq('account_id', accountId)
+          .limit(1)
+          .maybeSingle();
+
+        await supabase
+          .from('whatsapp_config')
+          .insert({
+            account_id: accountId,
+            user_id: profile?.user_id,
+            phone_number_id: session.phone || 'whatsapp_web',
+            waba_id: 'whatsapp_web',
+            access_token: 'whatsapp_web_session',
+            verify_token: 'whatsapp_web_session',
+            status: 'connected',
+            updated_at: new Date().toISOString(),
+          });
+      }
+    } catch (e) {
+      console.error(`[WA][${accountId.slice(0, 8)}] Error guardando estado en whatsapp_config:`, e.message);
+    }
+
+    // Limpiar watchdog ya que llegamos a ready
+    if (session._authWatchdog) { clearTimeout(session._authWatchdog); session._authWatchdog = null; }
+
+    setInterval(() => checkUnreadChats(session), 2500);
+    // El modal-dismisser ya fue iniciado en 'authenticated', no duplicar
+
+    // Sincronizar historial y fotos 5 segundos tras conectar
+    setTimeout(() => {
+      syncRecentChats(session).catch(e =>
+        console.error(`[WA][${accountId.slice(0, 8)}] Error en sync automático:`, e.message)
+      );
+    }, 5000);
+  });
+
+  client.on('message', async (msg) => {
+    if (msg.fromMe || msg.from.includes('@g.us') || msg.from === 'status@broadcast') return;
+    if (msg.timestamp && msg.timestamp < session.readyTimestamp) return;
+    if (msg.id?.id) {
+      if (session.recentProcessedIds.has(msg.id.id)) return;
+      session.recentProcessedIds.add(msg.id.id);
+    }
+
+    const phone = await resolveRealPhone(session, msg.author || msg.from);
+    let name = null;
+    try { const c = await msg.getContact(); name = c?.pushname || c?.name || null; } catch {}
+
+    let mediaUrl = null;
+    if (msg.hasMedia) { try { await msg.downloadMedia(); } catch {} }
+
+    log(accountId, `📨 De +${phone}: "${msg.body?.slice(0, 50)}"`);
+    const result = await saveMessage(session, { phone, name, body: msg.body, mediaUrl, messageId: msg.id.id });
+    if (result) {
+      handleAiAutoReply(session, { conversationId: result.conversation.id, contactPhone: phone }).catch(() => {});
+    }
+  });
+
+  client.on('message_create', async (msg) => {
+    if (!msg.fromMe || msg.to?.includes('@g.us') || msg.to === 'status@broadcast') return;
+    if (msg.timestamp && msg.timestamp < session.readyTimestamp) return;
+    if (session.recentSentIds.has(msg.id.id)) { session.recentSentIds.delete(msg.id.id); return; }
+
+    const phone = await resolveRealPhone(session, msg.to);
+    let name = null;
+    try { const c = await msg.getContact(); name = c?.pushname || c?.name || null; } catch {}
+    await saveMessage(session, { phone, name, body: msg.body, messageId: msg.id.id, senderType: 'agent' });
+  });
+
+  client.on('disconnected', (reason) => {
+    log(accountId, `⚠️ Desconectado: ${reason}`);
+    supabase.from('whatsapp_config').update({ status: 'disconnected', updated_at: new Date().toISOString() }).eq('account_id', accountId).then(() => {});
+    restartSession(session, reason);
+  });
+
+  client.on('auth_failure', (msg) => {
+    session.status = 'error';
+    console.error(`[WA][${accountId.slice(0, 8)}] Error de autenticación:`, msg);
+  });
+
+  client.initialize();
+  return session;
+}
+
+async function restartSession(session, reason) {
+  if (session.isRestarting) return;
+  session.isRestarting = true;
+  log(session.accountId, `🔄 Reiniciando (${reason})...`);
+  try { if (session.client) await session.client.destroy().catch(() => {}); } catch {}
+  session.client = null;
+  session.status = 'initializing';
+  setTimeout(() => {
+    session.isRestarting = false;
+    initSession(session.accountId);
+  }, 5000);
+}
+
+async function stopSession(accountId) {
+  const session = sessions.get(accountId);
+  if (!session) return false;
+  try { if (session.client) await session.client.destroy().catch(() => {}); } catch {}
+  session.status = 'stopped';
+  session.client = null;
+  sessions.delete(accountId);
+  log(accountId, '⏹ Sesión detenida');
+  return true;
+}
+
+// ─── Carga inicial: sesiones de todas las cuentas activas ─────────────────────
+async function loadAllSessions() {
+  log(null, 'Cargando sesiones activas desde Supabase...');
+  const { data: configs, error } = await supabase
+    .from('whatsapp_config')
+    .select('account_id, status')
+    .in('status', ['connected', 'qr', 'authenticated']);
+
+  if (error) { console.error('[WA-Service] Error:', error.message); return; }
+  if (!configs?.length) { log(null, 'Sin sesiones activas — esperando activaciones vía POST /sessions/:accountId/start'); return; }
+
+  log(null, `Iniciando ${configs.length} sesión(es)...`);
+  for (const cfg of configs) {
+    initSession(cfg.account_id);
+    await new Promise(r => setTimeout(r, 3000)); // espaciar inicializaciones
+  }
+}
+
+// ─── HTTP Server ───────────────────────────────────────────────────────────────
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // CORS — permitir llamadas desde el CRM (Next.js) y cualquier origen
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  const json = (data, code = 200) => {
+    res.writeHead(code, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(data));
+  };
+
+  const html = (content, code = 200) => {
+    res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(content);
+  };
+
+  // ── GET /status ────────────────────────────────────────────────────────────
+  if (req.method === 'GET' && url.pathname === '/status') {
+    return json({
+      service: 'running',
+      version: 'saas-multitenant',
+      sessions: sessions.size,
+      accounts: [...sessions.entries()].map(([id, s]) => ({ accountId: id, status: s.status, phone: s.phone })),
+    });
+  }
+
+  // ── GET /sessions ──────────────────────────────────────────────────────────
+  if (req.method === 'GET' && url.pathname === '/sessions') {
+    return json([...sessions.entries()].map(([id, s]) => ({ accountId: id, status: s.status, phone: s.phone })));
+  }
+
+  // ── Rutas /sessions/:accountId/* ───────────────────────────────────────────
+  const m = url.pathname.match(/^\/sessions\/([^/]+)(\/.*)?$/);
+  if (m) {
+    const accountId = m[1];
+    const sub = m[2] || '/status';
+    const session = sessions.get(accountId);
+
+    // GET /sessions/:accountId/status
+    if (req.method === 'GET' && sub === '/status') {
+      if (!session) return json({ accountId, status: 'disconnected', qr: null, phone: null });
+      return json({
+        accountId,
+        status: session.status,
+        phone: session.phone || null,
+        qr: session.qr || null,
+      });
+    }
+
+    // GET /sessions/:accountId/qr-data
+    if (req.method === 'GET' && sub === '/qr-data') {
+      return json({
+        accountId,
+        status: session?.status || 'disconnected',
+        qr: session?.qr || null,
+        phone: session?.phone || null,
+      });
+    }
+
+    // GET /sessions/:accountId/qr — página HTML con QR
+    if (req.method === 'GET' && sub === '/qr') {
+      const isReady = session?.status === 'ready' || session?.status === 'authenticated';
+      const hasQr = session?.status === 'qr' && session?.qr;
+      const qrImg = hasQr ? await qrcode.toDataURL(session.qr, { width: 280, margin: 2 }) : null;
+
+      return html(`<!DOCTYPE html>
+<html lang="es"><head>
+  <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Conectar WhatsApp</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:'Segoe UI',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0f172a,#1e293b);color:#fff}
     .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:24px;padding:48px;text-align:center;max-width:420px;width:90%;box-shadow:0 25px 50px rgba(0,0,0,.5)}
-    h1{font-size:22px;margin-bottom:8px}
-    p{color:#94a3b8;font-size:14px;margin-bottom:24px;line-height:1.6}
+    h1{font-size:22px;margin-bottom:8px}p{color:#94a3b8;font-size:14px;margin-bottom:24px;line-height:1.6}
     .qr{background:#fff;border-radius:16px;padding:16px;display:inline-block;margin-bottom:24px}
     .ready{background:rgba(37,211,102,.15);border:1px solid #25d366;border-radius:12px;padding:24px;color:#25d366;font-size:18px;font-weight:700}
     .waiting{color:#94a3b8;padding:32px}
@@ -928,105 +960,157 @@ const server = http.createServer(async (req, res) => {
     .step{display:flex;gap:10px;align-items:center;padding:6px 0;font-size:13px;color:#cbd5e1}
     .n{background:#25d366;border-radius:50%;width:22px;height:22px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:11px;flex-shrink:0}
   </style>
-  <script>setInterval(async()=>{const r=await fetch('/status');const d=await r.json();if(d.status==='ready'||d.status==='qr')location.reload();},3000)</script>
-</head>
-<body><div class="card">
+  <script>setInterval(async()=>{const r=await fetch('/sessions/${accountId}/status');const d=await r.json();if(['ready','qr'].includes(d.status))location.reload();},3000)</script>
+</head><body><div class="card">
   <div style="font-size:44px;margin-bottom:12px">💬</div>
-  <h1>WhatsApp CRM</h1>
-  ${status === 'ready' || status === 'authenticated' || !!whatsappClient?.info?.wid
-    ? `<div class="ready">✅ Conectado<br><span style="font-size:13px;font-weight:400;color:#86efac;margin-top:6px;display:block">${CRM_PHONE}</span></div>`
-    : status === 'qr' && qrImg
-      ? `<p>Escaneá con tu celular para conectar <strong>${CRM_PHONE}</strong></p>
+  <h1>Conectar WhatsApp</h1>
+  ${isReady
+    ? `<div class="ready">✅ Conectado<br><span style="font-size:13px;font-weight:400;color:#86efac;margin-top:6px;display:block">${session.phone || ''}</span></div>`
+    : hasQr
+      ? `<p>Escaneá con tu celular para conectar esta cuenta</p>
          <div class="qr"><img src="${qrImg}" width="248" height="248"/></div>
          <div class="steps">
            <div class="step"><span class="n">1</span>Abrí WhatsApp en tu celular</div>
            <div class="step"><span class="n">2</span>Tocá ⋮ → Dispositivos vinculados</div>
            <div class="step"><span class="n">3</span>Tocá "Vincular dispositivo"</div>
-           <div class="step"><span class="n">4</span>Apuntá la cámara aquí</div>
+           <div class="step"><span class="n">4</span>Apuntá la cámara al QR</div>
          </div>`
-      : `<div class="waiting"><div class="spinner"></div>Iniciando...</div>`
+      : `<div class="waiting"><div class="spinner"></div>Iniciando... (${session?.status || 'no iniciado'})</div>`
   }
 </div></body></html>`);
-    return;
-  }
-
-  // POST /send — enviar mensaje desde el CRM
-  if (req.method === 'POST' && url.pathname === '/send') {
-    const isConnected = status === 'ready' || status === 'authenticated' || !!whatsappClient?.info?.wid;
-    if (!isConnected) {
-      res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'WhatsApp no conectado', status }));
-      return;
     }
 
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
-      try {
-        const { to, message, mediaUrl, fromCrm } = JSON.parse(body);
-        if (!to || (!message && !mediaUrl)) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Faltan parámetros: to, message' }));
-          return;
-        }
-
-        // Resolver el ID real del número (necesario para multi-device WhatsApp)
-        const digits = normalizePhone(to);
-        const numberId = await whatsappClient.getNumberId(digits);
-        if (!numberId) {
-          res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `El número ${to} no tiene WhatsApp activo` }));
-          return;
-        }
-        const chatId = numberId._serialized;
-        let msgResult;
-
-        if (mediaUrl) {
-          const media = await MessageMedia.fromUrl(mediaUrl);
-          msgResult = await whatsappClient.sendMessage(chatId, media, { caption: message || '' });
-        } else {
-          msgResult = await whatsappClient.sendMessage(chatId, message);
-        }
-
-        const messageId = msgResult?.id?.id || msgResult?.id?._serialized || `wa-out-${Date.now()}`;
-        if (msgResult?.id?.id) recentSentIds.add(msgResult.id.id);
-
-        // Si no fue enviado desde la API del CRM (que ya guarda en DB), guardarlo aquí
-        if (!fromCrm) {
-          await saveMessageToSupabase({
-            phone: digits,
-            body: message,
-            mediaUrl,
-            messageId,
-            senderType: 'agent',
-          });
-        }
-
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, messageId }));
-        console.log(`[WA-Service] ✅ Mensaje enviado a ${to}`);
-
-      } catch (err) {
-        console.error('[WA-Service] Error enviando:', err.message);
-        if (err.message && (err.message.includes('detached Frame') || err.message.includes('Session closed') || err.message.includes('Target closed'))) {
-          restartWhatsApp(err.message);
-        }
-        if (!res.headersSent) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: err.message }));
-        }
+    // POST /sessions/:accountId/start
+    if (req.method === 'POST' && sub === '/start') {
+      if (session?.status === 'ready') {
+        return json({ accountId, status: 'ready', phone: session.phone });
       }
-    });
-    return;
+      if (session?.status === 'qr' && session.qr) {
+        return json({ accountId, status: 'qr', qr: session.qr, qrUrl: `/sessions/${accountId}/qr` });
+      }
+      if (session?.status === 'initializing') {
+        return json({ accountId, status: 'initializing', qrUrl: `/sessions/${accountId}/qr` });
+      }
+      initSession(accountId);
+      return json({ accountId, status: 'initializing', qrUrl: `/sessions/${accountId}/qr` });
+    }
+
+    // POST /sessions/:accountId/restart
+    if (req.method === 'POST' && sub === '/restart') {
+      await stopSession(accountId);
+      initSession(accountId);
+      return json({ accountId, status: 'initializing', qrUrl: `/sessions/${accountId}/qr` });
+    }
+
+    // POST /sessions/:accountId/sync — sincronizar chats recientes y fotos
+    if (req.method === 'POST' && sub === '/sync') {
+      const isConn = session?.status === 'ready' || session?.status === 'authenticated';
+      if (!isConn) {
+        return json({ error: 'WhatsApp no está conectado todavía', status: session?.status || 'disconnected' }, 400);
+      }
+      const body = await new Promise(resolve => {
+        let raw = '';
+        req.on('data', c => raw += c);
+        req.on('end', () => { try { resolve(JSON.parse(raw)); } catch { resolve({}); } });
+      });
+      const maxChats = body.maxChats || 50;
+      const msgsPerChat = body.msgsPerChat || 50;
+      const result = await syncRecentChats(session, maxChats, msgsPerChat);
+      return json({ accountId, ...result });
+    }
+
+    // POST /sessions/:accountId/stop
+    if (req.method === 'POST' && sub === '/stop') {
+      return json({ accountId, stopped: await stopSession(accountId) });
+    }
+
+    // POST /sessions/:accountId/send
+    if (req.method === 'POST' && sub === '/send') {
+      const isConn = session?.status === 'ready' || session?.status === 'authenticated';
+      if (!isConn) return json({ error: 'WhatsApp no conectado', accountId, status: session?.status || 'not_started' }, 503);
+
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', async () => {
+        try {
+          const { to, message, mediaUrl, fromCrm } = JSON.parse(body);
+          if (!to || (!message && !mediaUrl)) return json({ error: 'Faltan parámetros: to, message' }, 400);
+
+          const digits = normalizePhone(to);
+          const numberId = await session.client.getNumberId(digits);
+          if (!numberId) return json({ error: `El número ${to} no tiene WhatsApp activo` }, 404);
+
+          const chatId = numberId._serialized;
+          let msgResult;
+          if (mediaUrl) {
+            const media = await MessageMedia.fromUrl(mediaUrl);
+            msgResult = await session.client.sendMessage(chatId, media, { caption: message || '' });
+          } else {
+            msgResult = await session.client.sendMessage(chatId, message);
+          }
+
+          const messageId = msgResult?.id?.id || `wa-out-${Date.now()}`;
+          if (msgResult?.id?.id) session.recentSentIds.add(msgResult.id.id);
+
+          if (!fromCrm) {
+            await saveMessage(session, { phone: digits, body: message, mediaUrl, messageId, senderType: 'agent' });
+          }
+
+          json({ success: true, messageId });
+          log(accountId, `✅ Mensaje enviado a ${to}`);
+        } catch (err) {
+          console.error(`[WA][${accountId.slice(0, 8)}] Error enviando:`, err.message);
+          if (err.message?.match(/detached Frame|Session closed/)) restartSession(session, err.message);
+          if (!res.headersSent) json({ error: err.message }, 500);
+        }
+      });
+      return;
+    }
   }
 
-  res.writeHead(404);
-  res.end('Not found');
+  // ── GET / — dashboard HTML ────────────────────────────────────────────────
+  if (req.method === 'GET' && url.pathname === '/') {
+    const rows = [...sessions.entries()].map(([id, s]) =>
+      `<tr>
+        <td style="font-size:11px;color:#64748b">${id}</td>
+        <td><span style="color:${s.status === 'ready' ? '#22c55e' : s.status === 'qr' ? '#f59e0b' : '#94a3b8'};font-weight:600">${s.status}</span></td>
+        <td>${s.phone || '—'}</td>
+        <td><a href="/sessions/${id}/qr">Ver QR</a> · <a href="/sessions/${id}/status">JSON</a></td>
+      </tr>`
+    ).join('');
+
+    return html(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>WA Multi-Tenant Service</title>
+<style>body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:40px;line-height:1.6}
+h1{font-size:24px;margin-bottom:4px}p.sub{color:#64748b;margin-bottom:28px}
+table{border-collapse:collapse;width:100%;margin-bottom:24px}
+th,td{padding:12px 16px;border:1px solid #1e293b;text-align:left}
+th{background:#1e293b;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8}
+a{color:#60a5fa;text-decoration:none}a:hover{text-decoration:underline}
+.badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px;background:#1e293b}</style>
+</head><body>
+<h1>🟢 WhatsApp Multi-Tenant Service</h1>
+<p class="sub">Sesiones activas: <strong>${sessions.size}</strong> · Versión: SaaS Multi-Tenant</p>
+<table>
+  <thead><tr><th>Account ID</th><th>Estado</th><th>Teléfono</th><th>Acciones</th></tr></thead>
+  <tbody>${rows || '<tr><td colspan="4" style="color:#475569;text-align:center;padding:32px">Sin sesiones activas.<br><small>POST /sessions/:accountId/start para iniciar una cuenta.</small></td></tr>'}</tbody>
+</table>
+<p style="color:#475569;font-size:13px">
+  <strong>API:</strong><br>
+  POST /sessions/:accountId/start — Iniciar sesión<br>
+  POST /sessions/:accountId/stop — Detener sesión<br>
+  GET  /sessions/:accountId/qr — Ver QR para escanear<br>
+  POST /sessions/:accountId/send — Enviar mensaje
+</p>
+</body></html>`);
+  }
+
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found', path: url.pathname }));
 });
 
-server.listen(PORT, () => {
-  console.log(`\n🚀 WhatsApp Service corriendo en http://localhost:${PORT}`);
-  console.log(`📱 Número del CRM: ${CRM_PHONE}`);
-  console.log(`🌐 Para escanear el QR: http://localhost:${PORT}\n`);
-  initWhatsApp();
+server.listen(PORT, async () => {
+  console.log(`\n🚀 WhatsApp Multi-Tenant Service — http://localhost:${PORT}`);
+  console.log(`📋 Dashboard: http://localhost:${PORT}/`);
+  console.log(`📡 API: POST /sessions/:accountId/start\n`);
+  await loadAllSessions();
 });

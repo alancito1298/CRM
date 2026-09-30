@@ -45,6 +45,7 @@ import {
 } from '@/lib/whatsapp/phone-utils';
 import type { MessageTemplate } from '@/types';
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard';
+import { checkActionAllowed, recordMessageSent } from '@/lib/saas/plans';
 
 export const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const;
 export const VALID_MESSAGE_TYPES = [
@@ -216,6 +217,16 @@ export async function sendMessageToConversation(
     interactivePayload,
   });
 
+  // Verificar límites del plan SaaS para esta cuenta
+  const limitCheck = await checkActionAllowed(db, accountId, 'send_message');
+  if (!limitCheck.allowed) {
+    throw new SendMessageError(
+      'plan_limit_reached',
+      limitCheck.reason || 'Límite de mensajes mensuales alcanzado para el plan actual.',
+      403
+    );
+  }
+
   const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(messageType);
 
   // Conversation + contact, account-scoped.
@@ -331,12 +342,36 @@ export async function sendMessageToConversation(
   }
 
   const attempt = async (phone: string): Promise<string> => {
-    // ── WhatsApp Web Service (localhost:3001) — gratis, sin API externa ──
+    // ── WhatsApp Web Service (multi-tenant) — gratis, sin API externa ──
     try {
       const waServiceUrl = process.env.WA_SERVICE_URL || 'http://localhost:3001';
-      const statusRes = await fetch(`${waServiceUrl}/status`, { signal: AbortSignal.timeout(2000) });
-      if (statusRes.ok) {
-        const { status: waStatus } = await statusRes.json() as { status: string };
+      // 1. Intentar endpoint multi-tenant por cuenta
+      const sessionStatusRes = await fetch(`${waServiceUrl}/sessions/${accountId}/status`, { signal: AbortSignal.timeout(2000) });
+      if (sessionStatusRes.ok) {
+        const { status: waStatus } = await sessionStatusRes.json() as { status: string };
+        if (waStatus === 'ready') {
+          const sendRes = await fetch(`${waServiceUrl}/sessions/${accountId}/send`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              to: phone,
+              message: contentText || (messageType === 'template' ? `[Plantilla: ${templateName}]` : ''),
+              mediaUrl: mediaUrl || undefined,
+              fromCrm: true,
+            }),
+            signal: AbortSignal.timeout(15000),
+          });
+          if (sendRes.ok) {
+            const data = await sendRes.json() as { messageId?: string };
+            return data.messageId || `wa-web-${Date.now()}`;
+          }
+        }
+      }
+
+      // 2. Fallback por compatibilidad con sesión global legacy
+      const globalStatusRes = await fetch(`${waServiceUrl}/status`, { signal: AbortSignal.timeout(1500) });
+      if (globalStatusRes.ok) {
+        const { status: waStatus } = await globalStatusRes.json() as { status: string };
         if (waStatus === 'ready') {
           const sendRes = await fetch(`${waServiceUrl}/send`, {
             method: 'POST',
@@ -552,6 +587,13 @@ export async function sendMessageToConversation(
       '[flows] pause-on-agent-send threw:',
       err instanceof Error ? err.message : err
     );
+  }
+
+  // Incrementar contador de mensajes usados en el mes para el SaaS
+  try {
+    await recordMessageSent(db, accountId);
+  } catch (trackErr) {
+    console.warn('[saas] could not record message usage:', trackErr);
   }
 
   return { messageId: messageRecord.id, whatsappMessageId: waMessageId };

@@ -32,6 +32,7 @@ import {
   rateLimitResponse,
   RATE_LIMITS,
 } from "@/lib/rate-limit";
+import { checkActionAllowed } from "@/lib/saas/plans";
 
 // Resolve the base URL we publish invite links under.
 //
@@ -177,6 +178,15 @@ export async function POST(request: Request) {
       RATE_LIMITS.adminAction,
     );
     if (!limit.success) return rateLimitResponse(limit);
+
+    // Verificar límites de miembros del plan SaaS
+    const planLimitCheck = await checkActionAllowed(ctx.supabase, ctx.accountId, 'invite_agent');
+    if (!planLimitCheck.allowed) {
+      return NextResponse.json(
+        { error: planLimitCheck.reason || 'Límite de agentes alcanzado para el plan actual' },
+        { status: 403 },
+      );
+    }
 
     const body = (await request.json().catch(() => null)) as
       | { role?: unknown; expiresInDays?: unknown; label?: unknown }

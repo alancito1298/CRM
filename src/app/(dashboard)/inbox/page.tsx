@@ -172,44 +172,70 @@ function InboxPageInner() {
     }
   }, []);
 
-  // Check WhatsApp connection status on mount
+  // Check WhatsApp connection status on mount and poll
   useEffect(() => {
+    let mounted = true;
+
     const checkConnection = async () => {
-      const supabase = createClient();
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      const user = session?.user;
-
-      if (!user) return;
-
-      // whatsapp_config is one-row-per-account post-multi-user, so
-      // the previous `.eq('user_id', user.id)` would miss the row
-      // for any teammate who didn't personally save the config —
-      // the "WhatsApp not connected" banner would show in the
-      // shared inbox even though the admin had it configured.
-      // Resolve account_id via the profile and query by that.
-      const { data: profile } = await supabase
-        .from("profiles")
-        .select("account_id")
-        .eq("user_id", user.id)
-        .maybeSingle();
-      const accountId = profile?.account_id as string | undefined;
-      if (!accountId) {
-        setWhatsappConnected(false);
-        return;
+      try {
+        // 1. Verificar estado en vivo mediante el servicio de WhatsApp
+        const res = await fetch("/api/whatsapp/service", { cache: "no-store" });
+        if (res.ok) {
+          const serviceData = await res.json();
+          if (
+            serviceData.status === "ready" ||
+            serviceData.status === "authenticated" ||
+            serviceData.status === "connected"
+          ) {
+            if (mounted) setWhatsappConnected(true);
+            return;
+          }
+        }
+      } catch {
+        // Fallback a base de datos si el endpoint falla
       }
 
-      const { data } = await supabase
-        .from("whatsapp_config")
-        .select("status")
-        .eq("account_id", accountId)
-        .maybeSingle();
+      // 2. Comprobar configuración guardada en Supabase
+      try {
+        const supabase = createClient();
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        const user = session?.user;
 
-      setWhatsappConnected(data?.status === "connected");
+        if (!user) return;
+
+        const { data: profile } = await supabase
+          .from("profiles")
+          .select("account_id")
+          .eq("user_id", user.id)
+          .maybeSingle();
+        const accountId = profile?.account_id as string | undefined;
+        if (!accountId) {
+          if (mounted) setWhatsappConnected(false);
+          return;
+        }
+
+        const { data } = await supabase
+          .from("whatsapp_config")
+          .select("status")
+          .eq("account_id", accountId)
+          .maybeSingle();
+
+        if (mounted) {
+          setWhatsappConnected(data?.status === "connected" || data?.status === "ready");
+        }
+      } catch {
+        if (mounted) setWhatsappConnected(false);
+      }
     };
 
     checkConnection();
+    const interval = setInterval(checkConnection, 10000);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
   }, []);
 
   // Handle realtime message events
