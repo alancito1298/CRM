@@ -481,16 +481,18 @@ function ConversationItem({
       )}
     >
       {/* Avatar */}
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground">
+      <div className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground overflow-hidden">
         {contact?.avatar_url ? (
           <img
             src={contact.avatar_url}
             alt={displayName}
-            className="h-10 w-10 rounded-full object-cover"
+            className="h-full w-full object-cover"
+            onError={(e) => {
+              (e.currentTarget as HTMLElement).style.display = "none";
+            }}
           />
-        ) : (
-          initials
-        )}
+        ) : null}
+        <span className={contact?.avatar_url ? "hidden" : ""}>{initials}</span>
       </div>
 
       {/* Content */}

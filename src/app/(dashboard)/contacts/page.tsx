@@ -601,7 +601,26 @@ export default function ContactsPage() {
                     />
                   </TableCell>
                   <TableCell className="text-foreground font-medium">
-                    {contact.name || <span className="text-muted-foreground italic">{t('unnamed')}</span>}
+                    <div className="flex items-center gap-2.5">
+                      <div className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-semibold text-foreground overflow-hidden">
+                        {contact.avatar_url ? (
+                          <img
+                            src={contact.avatar_url}
+                            alt={contact.name || contact.phone}
+                            className="h-full w-full object-cover"
+                            onError={(e) => {
+                              (e.currentTarget as HTMLElement).style.display = "none";
+                            }}
+                          />
+                        ) : null}
+                        <span className={contact.avatar_url ? "hidden" : ""}>
+                          {(contact.name || contact.phone || "?").charAt(0).toUpperCase()}
+                        </span>
+                      </div>
+                      <span className="truncate">
+                        {contact.name || <span className="text-muted-foreground italic">{t('unnamed')}</span>}
+                      </span>
+                    </div>
                   </TableCell>
                   <TableCell className="text-muted-foreground font-mono text-xs">
                     {contact.phone}

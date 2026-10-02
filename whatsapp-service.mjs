@@ -124,6 +124,9 @@ async function resolveRealPhone(session, waId) {
   const clean = normalizePhone(waId);
   const { client } = session;
 
+  if (!session._lidCache) session._lidCache = new Map();
+  if (session._lidCache.has(clean)) return session._lidCache.get(clean);
+
   if ((waId.endsWith('@c.us') || !waId.includes('@')) && clean.length >= 10 && clean.length <= 13) {
     return clean;
   }
@@ -135,7 +138,10 @@ async function resolveRealPhone(session, waId) {
       const res = await client.getContactLidAndPhone(fullId);
       if (Array.isArray(res) && res[0]?.pn) {
         const p = normalizePhone(res[0].pn);
-        if (p) return p;
+        if (p) {
+          session._lidCache.set(clean, p);
+          return p;
+        }
       }
     }
   } catch {}
@@ -144,30 +150,40 @@ async function resolveRealPhone(session, waId) {
     if (client?.pupPage) {
       const res = await client.pupPage.evaluate(async (id) => {
         try {
-          if (window.WWebJS?.enforceLidAndPnRetrieval) {
-            const pair = await window.WWebJS.enforceLidAndPnRetrieval(id);
-            if (pair?.phone?._serialized) return pair.phone._serialized;
-          }
           const WidFactory = window.require('WAWebWidFactory');
           const wid = WidFactory.createWid(id);
           const ContactApi = window.require('WAWebApiContact');
+          if (ContactApi?.getPhoneNumber) {
+            const pn = ContactApi.getPhoneNumber(wid);
+            if (pn?.user) return pn.user;
+            if (pn?._serialized) return pn._serialized;
+          }
           if (ContactApi?.getAlternateUserWid) {
             const alt = ContactApi.getAlternateUserWid(wid);
-            if (alt?._serialized) return alt._serialized;
             if (alt?.user) return alt.user;
+            if (alt?._serialized) return alt._serialized;
           }
           const ContactCol = window.require('WAWebCollections')?.Contact;
           if (ContactCol) {
             const c = ContactCol.get(wid) || await ContactCol.find(wid);
+            if (c?.phoneNumber?.user) return c.phoneNumber.user;
             if (c?.phoneNumber?._serialized) return c.phoneNumber._serialized;
-            if (c?.id && !c.id.isLid()) return c.id._serialized;
+            if (c?.id && !c.id.isLid()) return c.id.user || c.id._serialized;
+          }
+          const ChatCol = window.require('WAWebCollections')?.Chat;
+          if (ChatCol) {
+            const ch = ChatCol.get(wid);
+            if (ch?.contact?.phoneNumber?.user) return ch.contact.phoneNumber.user;
           }
         } catch { return null; }
         return null;
       }, fullId);
       if (res) {
         const p = normalizePhone(res);
-        if (p) return p;
+        if (p) {
+          session._lidCache.set(clean, p);
+          return p;
+        }
       }
     }
   } catch {}
@@ -331,115 +347,82 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
 }
 
 // ─── Guardar mensaje en Supabase (por sesión) ─────────────────────────────────
-async function saveMessage(session, { phone, name, body, mediaUrl, messageId, senderType = 'customer', avatarUrl = null, createdAt = null }) {
+async function resolveUserId(session) {
+  if (session._userId) return session._userId;
+  const { accountId } = session;
+  const { data: waConfig } = await supabase.from('whatsapp_config').select('user_id').eq('account_id', accountId).maybeSingle();
+  if (waConfig?.user_id) { session._userId = waConfig.user_id; return waConfig.user_id; }
+  const { data: prof } = await supabase.from('profiles').select('user_id').eq('account_id', accountId).limit(1).maybeSingle();
+  if (prof?.user_id) { session._userId = prof.user_id; return prof.user_id; }
+  return null;
+}
+
+async function saveMessage(session, { phone, name, body, mediaUrl, messageId, senderType = 'customer', avatarUrl = null, createdAt = null, isHistoric = false }) {
   const { accountId } = session;
   try {
     const cleanPhone = normalizePhone(phone);
     if (!cleanPhone || cleanPhone.length > 15) return null;
     if (phone?.includes('@g.us') || phone?.includes('broadcast')) return null;
+    if (!body && !mediaUrl) return null; // no guardar mensajes vacíos
 
-    // Obtener user_id del owner de la cuenta para asignarlo en nuevas filas
-    const { data: waConfig } = await supabase
-      .from('whatsapp_config')
-      .select('user_id')
-      .eq('account_id', accountId)
-      .maybeSingle();
-    let userId = waConfig?.user_id || null;
-
-    if (!userId) {
-      const { data: prof } = await supabase
-        .from('profiles')
-        .select('user_id')
-        .eq('account_id', accountId)
-        .limit(1)
-        .maybeSingle();
-      userId = prof?.user_id || null;
-    }
+    const userId = await resolveUserId(session);
+    const variants = getPhoneVariants(cleanPhone);
 
     // Buscar o crear contacto
-    const variants = getPhoneVariants(cleanPhone);
     let { data: contact } = await supabase
-      .from('contacts')
-      .select('id, name, phone, avatar_url')
-      .eq('account_id', accountId)
-      .in('phone', variants)
-      .limit(1)
-      .maybeSingle();
+      .from('contacts').select('id, name, phone, avatar_url')
+      .eq('account_id', accountId).in('phone', variants).limit(1).maybeSingle();
 
     if (!contact) {
       const { data: newContact, error } = await supabase
         .from('contacts')
-        .insert({
-          account_id: accountId,
-          user_id: userId,
-          phone: `+${cleanPhone}`,
-          name: name || `+${cleanPhone}`,
-          avatar_url: avatarUrl || null,
-        })
-        .select()
-        .single();
+        .insert({ account_id: accountId, user_id: userId, phone: `+${cleanPhone}`, name: name || `+${cleanPhone}`, avatar_url: avatarUrl || null })
+        .select().single();
       if (error) { console.error(`[WA][${accountId.slice(0, 8)}] Error contacto:`, error.message); return null; }
       contact = newContact;
-      log(accountId, `Nuevo contacto: ${contact.phone}${avatarUrl ? ' (con foto)' : ''}`);
+      log(accountId, `Nuevo contacto: ${contact.phone}${avatarUrl ? ' 🖼️' : ''}`);
     } else {
       const updates = {};
-      if (name && (contact.name === contact.phone || !contact.name) && name !== contact.phone) {
-        updates.name = name;
-      }
-      if (avatarUrl && (!contact.avatar_url || contact.avatar_url !== avatarUrl)) {
-        updates.avatar_url = avatarUrl;
-      }
+      if (name && (contact.name === contact.phone || !contact.name) && name !== contact.phone) updates.name = name;
+      if (avatarUrl && contact.avatar_url !== avatarUrl) updates.avatar_url = avatarUrl;
       if (Object.keys(updates).length > 0) {
         await supabase.from('contacts').update(updates).eq('id', contact.id);
+        Object.assign(contact, updates);
       }
     }
 
-    // Buscar o crear conversación
     const timestamp = createdAt || new Date().toISOString();
+
+    // Buscar o crear conversación (reusar cualquier conversación existente del contacto)
     let { data: conversation } = await supabase
-      .from('conversations')
-      .select('id, last_message_at')
-      .eq('account_id', accountId)
-      .eq('contact_id', contact.id)
-      .eq('status', 'open')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .from('conversations').select('id, last_message_at, unread_count, status')
+      .eq('account_id', accountId).eq('contact_id', contact.id)
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
 
     if (!conversation) {
       const { data: newConv, error } = await supabase
         .from('conversations')
         .insert({
-          account_id: accountId,
-          user_id: userId,
-          contact_id: contact.id,
-          status: 'open',
-          last_message_at: timestamp,
+          account_id: accountId, user_id: userId, contact_id: contact.id,
+          status: 'open', last_message_at: timestamp,
           last_message_text: body?.slice(0, 255) || '',
-          unread_count: senderType === 'customer' ? 1 : 0,
+          unread_count: (!isHistoric && senderType === 'customer') ? 1 : 0,
         })
-        .select()
-        .single();
+        .select().single();
       if (error) { console.error(`[WA][${accountId.slice(0, 8)}] Error conversación:`, error.message); return null; }
       conversation = newConv;
       log(accountId, `Nueva conversación: ${conversation.id}`);
+    } else if (conversation.status !== 'open') {
+      await supabase.from('conversations').update({ status: 'open' }).eq('id', conversation.id);
     }
 
-    // Deduplicación: no insertar si el message_id ya existe
-    const finalMsgId = messageId || `wa-${Date.now()}`;
+    // Deduplicación estricta por message_id
+    const finalMsgId = messageId || `wa-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     if (messageId) {
-      const { data: existingMsg } = await supabase
-        .from('messages')
-        .select('id')
-        .eq('conversation_id', conversation.id)
-        .eq('message_id', finalMsgId)
-        .maybeSingle();
-      if (existingMsg) {
-        return { contact, conversation, alreadyExists: true };
-      }
+      const { data: existingMsg } = await supabase.from('messages').select('id').eq('message_id', finalMsgId).maybeSingle();
+      if (existingMsg) return { contact, conversation, alreadyExists: true };
     }
 
-    // Insertar mensaje
     const contentText = body || (mediaUrl ? '[Archivo multimedia]' : '');
     const { error: msgErr } = await supabase.from('messages').insert({
       conversation_id: conversation.id,
@@ -454,15 +437,21 @@ async function saveMessage(session, { phone, name, body, mediaUrl, messageId, se
     });
     if (msgErr) { console.error(`[WA][${accountId.slice(0, 8)}] Error mensaje:`, msgErr.message); return null; }
 
-    // Actualizar last_message_at sólo si este mensaje es más reciente
+    // Actualizar conversación solo si el mensaje es más reciente
+    const convUpdates = {};
     if (!conversation.last_message_at || new Date(timestamp) >= new Date(conversation.last_message_at)) {
-      await supabase.from('conversations').update({
-        last_message_at: timestamp,
-        last_message_text: contentText.slice(0, 255),
-      }).eq('id', conversation.id);
+      convUpdates.last_message_at = timestamp;
+      convUpdates.last_message_text = contentText.slice(0, 255);
+    }
+    // Incrementar unread solo para mensajes en tiempo real de clientes
+    if (!isHistoric && senderType === 'customer') {
+      convUpdates.unread_count = (conversation.unread_count || 0) + 1;
+    }
+    if (Object.keys(convUpdates).length > 0) {
+      await supabase.from('conversations').update(convUpdates).eq('id', conversation.id);
     }
 
-    log(accountId, `✅ Mensaje (${senderType}) en conv ${conversation.id}`);
+    if (!isHistoric) log(accountId, `✅ Mensaje (${senderType}) en conv ${conversation.id}`);
     return { contact, conversation };
   } catch (err) {
     console.error(`[WA][${accountId.slice(0, 8)}] Error guardando mensaje:`, err.message);
@@ -473,118 +462,360 @@ async function saveMessage(session, { phone, name, body, mediaUrl, messageId, se
 // ─── Sincronizar chats recientes y fotos de perfil ───────────────────────────
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function syncRecentChats(session, maxChats = 50, msgsPerChat = 50) {
-  const { accountId, client } = session;
-  if (!client) return { syncedChats: 0, syncedMessages: 0 };
-  log(accountId, `🔄 Iniciando sincronización de ${maxChats} chats recientes con historial y fotos...`);
-
-  // whatsapp-web.js puede rechazar getChats() si el cliente aún no está
-  // completamente listo internamente. Reintentar hasta 3 veces.
-  let chats = null;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      await sleep(attempt === 1 ? 3000 : 5000);
-      chats = await client.getChats();
-      break;
-    } catch (e) {
-      console.error(`[WA][${accountId.slice(0, 8)}] getChats intento ${attempt}/3 fallido:`, e?.message || e);
-      if (attempt === 3) return { error: `getChats falló después de 3 intentos: ${e?.message || e}` };
-    }
-  }
+async function getContactAvatar(session, chatId) {
+  if (!session?.client?.pupPage || !chatId) return null;
+  if (!session._avatarCache) session._avatarCache = new Map();
+  if (session._avatarCache.has(chatId)) return session._avatarCache.get(chatId);
 
   try {
-    log(accountId, `Total chats en WhatsApp: ${chats.length}`);
-
-    const eligibleChats = chats
-      .filter(c => !c.id?._serialized?.includes('status@broadcast') && !c.isGroup)
-      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
-      .slice(0, maxChats);
-
-    let totalSyncedChats = 0;
-    let totalSyncedMsgs = 0;
-
-    for (const chat of eligibleChats) {
+    const avatarUrl = await session.client.pupPage.evaluate(async (idStr) => {
       try {
-        const rawPhone = chat.id?.user || chat.id?._serialized?.split('@')[0];
-        const phone = normalizePhone(rawPhone);
-        if (!phone) continue;
+        const collections = window.require?.('WAWebCollections') || window.Store;
+        const widFactory = window.require?.('WAWebWidFactory') || window.Store?.WidFactory;
+        const bridge = window.require?.('WAWebContactProfilePicThumbBridge');
 
-        // Nombre del contacto
-        let name = chat.name || chat.formattedTitle;
-        if (!name || name === rawPhone || name === phone) {
-          try {
-            const c = await chat.getContact();
-            name = c?.pushname || c?.name || null;
-          } catch {}
-        }
-        if (!name) name = `+${phone}`;
+        const wid = widFactory?.createWid ? widFactory.createWid(idStr) : idStr;
 
-        // Foto de perfil del contacto
-        let avatarUrl = null;
-        try {
-          avatarUrl = await client.getProfilePicUrl(chat.id._serialized);
-        } catch {}
-
-        // Mensajes históricos del chat
-        let messages = [];
-        try {
-          messages = await chat.fetchMessages({ limit: msgsPerChat });
-        } catch {}
-
-        if ((!messages || messages.length === 0) && chat.lastMessage) {
-          messages = [chat.lastMessage];
-        }
-
-        if (messages && messages.length > 0) {
-          messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-
-          for (const msg of messages) {
-            if (!msg.body && !msg.hasMedia) continue;
-            const senderType = msg.fromMe ? 'agent' : 'customer';
-            const msgBody = msg.body || (msg.hasMedia ? `[${msg.type || 'Archivo multimedia'}]` : '');
-            const msgTimestamp = msg.timestamp
-              ? new Date(msg.timestamp * 1000).toISOString()
-              : new Date().toISOString();
-            const msgId = msg.id?.id || msg.id?._serialized || `wa-hist-${msg.timestamp}-${phone}`;
-
-            const res = await saveMessage(session, {
-              phone,
-              name,
-              body: msgBody,
-              mediaUrl: null,
-              messageId: msgId,
-              senderType,
-              avatarUrl,
-              createdAt: msgTimestamp,
-            });
-
-            if (res && !res.alreadyExists) totalSyncedMsgs++;
+        const toDataUrl = async (val) => {
+          if (!val || typeof val !== 'string') return null;
+          if (val.startsWith('http://') || val.startsWith('https://') || val.startsWith('data:')) return val;
+          if (val.startsWith('blob:')) {
+            try {
+              const res = await fetch(val);
+              if (!res.ok) return null;
+              const blob = await res.blob();
+              return await new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.onerror = () => resolve(null);
+                reader.readAsDataURL(blob);
+              });
+            } catch { return null; }
           }
-        } else {
-          // Si no hay mensajes, al menos creamos el contacto con foto
-          await saveMessage(session, {
-            phone,
-            name,
-            body: '',
-            messageId: null,
-            senderType: 'customer',
+          return val;
+        };
+
+        // 1. ProfilePicThumb Collection
+        const thumbColl = collections?.ProfilePicThumb;
+        let thumb = thumbColl?.get ? (thumbColl.get(wid) || thumbColl.get(idStr)) : null;
+        if (!thumb && thumbColl?.find) {
+          try { thumb = await thumbColl.find(wid); } catch {}
+        }
+        if (thumb?.eurl) return thumb.eurl;
+        if (thumb?.img) {
+          const c = await toDataUrl(thumb.img);
+          if (c) return c;
+        }
+
+        // 2. Chat model
+        const chatStore = collections?.Chat;
+        let chat = chatStore?.get ? (chatStore.get(wid) || chatStore.get(idStr)) : null;
+        if (!chat && chatStore?.getModelsArray) {
+          chat = chatStore.getModelsArray().find(c => c.id?._serialized === idStr || c.id?.user === idStr.replace(/\D/g, ''));
+        }
+
+        if (chat?.contact?.profilePicThumb?.eurl) return chat.contact.profilePicThumb.eurl;
+        if (chat?.contact?.profilePicThumb?.img) {
+          const c = await toDataUrl(chat.contact.profilePicThumb.img);
+          if (c) return c;
+        }
+
+        // 3. Contact model
+        const contactStore = collections?.Contact;
+        let contact = contactStore?.get ? (contactStore.get(wid) || contactStore.get(idStr)) : null;
+        if (contact?.profilePicThumb?.eurl) return contact.profilePicThumb.eurl;
+        if (contact?.profilePicThumb?.img) {
+          const c = await toDataUrl(contact.profilePicThumb.img);
+          if (c) return c;
+        }
+
+        // 4. Request from server via bridge
+        if (bridge?.requestProfilePicFromServer) {
+          const target = chat || contact;
+          if (target) {
+            try {
+              const res = await bridge.requestProfilePicFromServer(target);
+              if (res?.eurl) return res.eurl;
+              if (res?.img) {
+                const c = await toDataUrl(res.img);
+                if (c) return c;
+              }
+            } catch {}
+          }
+        }
+
+        return null;
+      } catch {
+        return null;
+      }
+    }, chatId);
+
+    if (avatarUrl) {
+      session._avatarCache.set(chatId, avatarUrl);
+      return avatarUrl;
+    }
+  } catch {}
+  return null;
+}
+
+// ─── Backfill de fotos para contactos existentes ─────────────────────────────
+async function backfillContactAvatars(session) {
+  const { accountId } = session;
+  if (!session?.client?.pupPage) return;
+  try {
+    const { data: contactsWithoutAvatar, error } = await supabase
+      .from('contacts')
+      .select('id, phone, name')
+      .eq('account_id', accountId)
+      .is('avatar_url', null)
+      .limit(60);
+
+    if (error || !contactsWithoutAvatar || contactsWithoutAvatar.length === 0) return;
+    log(accountId, `🔍 Buscando fotos de perfil para ${contactsWithoutAvatar.length} contactos...`);
+
+    let updatedCount = 0;
+    for (const c of contactsWithoutAvatar) {
+      const clean = normalizePhone(c.phone);
+      if (!clean) continue;
+      const chatId = `${clean}@c.us`;
+      const avatarUrl = await getContactAvatar(session, chatId);
+      if (avatarUrl) {
+        await supabase.from('contacts').update({ avatar_url: avatarUrl }).eq('id', c.id);
+        updatedCount++;
+        log(accountId, `🖼️ Foto actualizada para ${c.name || c.phone}`);
+      }
+      await sleep(150);
+    }
+    if (updatedCount > 0) {
+      log(accountId, `✅ ${updatedCount} foto(s) de perfil integradas.`);
+    }
+  } catch (err) {
+    console.error(`[WA][${accountId.slice(0, 8)}] Error en backfill de fotos:`, err.message);
+  }
+}
+
+async function syncRecentChats(session, maxChats = 50, msgsPerChat = 30) {
+  const { accountId, client } = session;
+  if (!client) return { syncedChats: 0, syncedMessages: 0 };
+  log(accountId, `🔄 Sincronizando ${maxChats} chats recientes...`);
+
+  // Esperar a que la página esté completamente cargada
+  await sleep(3000);
+
+  // Extraer chats directamente del store interno de WA Web via Puppeteer
+  // Esto evita el error 'r' de getChats() por incompatibilidad de versión
+  let rawChats = [];
+  try {
+    rawChats = await client.pupPage.evaluate(async (maxChats) => {
+      try {
+        const store = window.Store || window.require?.('WAWebCollections');
+        const chatStore = store?.Chat || store?.default?.Chat;
+        const models = chatStore?.getModelsArray?.() || chatStore?.models || [];
+        const thumbColl = window.require?.('WAWebCollections')?.ProfilePicThumb || store?.ProfilePicThumb;
+        const bridge = window.require?.('WAWebContactProfilePicThumbBridge');
+
+        const toDataUrl = async (val) => {
+          if (!val || typeof val !== 'string') return null;
+          if (val.startsWith('http://') || val.startsWith('https://') || val.startsWith('data:')) return val;
+          if (val.startsWith('blob:')) {
+            try {
+              const res = await fetch(val);
+              if (!res.ok) return null;
+              const blob = await res.blob();
+              return await new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.onerror = () => resolve(null);
+                reader.readAsDataURL(blob);
+              });
+            } catch { return null; }
+          }
+          return val;
+        };
+
+        const filtered = models
+          .filter(c => {
+            if (c.isGroup) return false;
+            const serialized = c.id?._serialized || '';
+            if (serialized.includes('@broadcast') || serialized.includes('status')) return false;
+            const digits = (c.id?.user || '').replace(/\D/g, '');
+            if (digits.length > 15 || digits.length < 7) return false;
+            return true;
+          })
+          .sort((a, b) => (b.t || 0) - (a.t || 0))
+          .slice(0, maxChats);
+
+        const results = [];
+        for (const c of filtered) {
+          const msgs = c.msgs?.getModelsArray?.() || [];
+          const validMsgs = msgs.filter(m => m.body || m.hasMedia).slice(-30);
+
+          let avatarUrl = null;
+          try {
+            const thumb = thumbColl?.get ? (thumbColl.get(c.id) || thumbColl.get(c.id?._serialized)) : null;
+            if (thumb?.eurl) {
+              avatarUrl = thumb.eurl;
+            } else if (thumb?.img) {
+              avatarUrl = await toDataUrl(thumb.img);
+            } else if (c.contact?.profilePicThumb?.eurl) {
+              avatarUrl = c.contact.profilePicThumb.eurl;
+            } else if (c.contact?.profilePicThumb?.img) {
+              avatarUrl = await toDataUrl(c.contact.profilePicThumb.img);
+            } else if (bridge?.requestProfilePicFromServer) {
+              try {
+                const res = await bridge.requestProfilePicFromServer(c);
+                if (res?.eurl) avatarUrl = res.eurl;
+                else if (res?.img) avatarUrl = await toDataUrl(res.img);
+              } catch {}
+            }
+          } catch {}
+
+          let resolvedPhone = null;
+          const isLid = c.id?._serialized?.endsWith('@lid') || c.id?.server === 'lid';
+          if (isLid) {
+            try {
+              const ContactApi = window.require?.('WAWebApiContact');
+              const pnWid = ContactApi?.getPhoneNumber?.(c.id) || ContactApi?.getAlternateUserWid?.(c.id);
+              if (pnWid?.user) resolvedPhone = pnWid.user;
+              else if (pnWid?._serialized) resolvedPhone = pnWid._serialized.split('@')[0];
+              else if (c.contact?.phoneNumber?.user) resolvedPhone = c.contact.phoneNumber.user;
+            } catch {}
+          } else {
+            resolvedPhone = c.id?.user || c.id?._serialized?.split('@')[0];
+          }
+
+          results.push({
+            chatId: c.id?._serialized,
+            phone: resolvedPhone || c.id?.user,
+            name: c.contact?.pushname || c.contact?.name || c.name || null,
             avatarUrl,
-            createdAt: new Date().toISOString(),
+            msgs: validMsgs.map(m => ({
+              id: m.id?._serialized || m.id?.id,
+              body: m.body || '',
+              fromMe: !!m.id?.fromMe,
+              timestamp: m.t || 0,
+              type: m.type || 'chat',
+              hasMedia: !!m.hasMedia,
+            })),
           });
         }
+        return results;
+      } catch (e) {
+        return [];
+      }
+    }, maxChats);
+  } catch (e) {
+    console.error(`[WA][${accountId.slice(0, 8)}] Error evaluate chats:`, e.message);
+  }
 
-        totalSyncedChats++;
-      } catch (chatError) {
-        console.error(`[WA][${accountId.slice(0, 8)}] Error en chat individual:`, chatError.message);
+  // Si la evaluación directa falló, intentar getChats() como fallback
+  if (!rawChats || rawChats.length === 0) {
+    log(accountId, 'Fallback: intentando getChats() API...');
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await sleep(attempt * 3000);
+        const chats = await client.getChats();
+        rawChats = chats
+          .filter(c => !c.isGroup && !c.id?._serialized?.includes('broadcast'))
+          .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+          .slice(0, maxChats)
+          .map(c => ({
+            chatId: c.id?._serialized,
+            phone: c.id?.user,
+            name: c.name || null,
+            msgs: [], // fetchMessages se hará después
+            _chatObj: c,
+          }));
+        break;
+      } catch (e) {
+        console.error(`[WA][${accountId.slice(0, 8)}] getChats intento ${attempt}/3:`, e?.message || String(e));
+        if (attempt === 3) {
+          log(accountId, '⚠️ No se pudo obtener lista de chats. El sync se hará solo con mensajes nuevos en tiempo real.');
+          return { syncedChats: 0, syncedMessages: 0, error: 'getChats no disponible' };
+        }
       }
     }
-
-    log(accountId, `✅ Sync completado: ${totalSyncedChats} contactos, ${totalSyncedMsgs} mensajes nuevos.`);
-    return { syncedChats: totalSyncedChats, syncedMessages: totalSyncedMsgs };
-  } catch (err) {
-    console.error(`[WA][${accountId.slice(0, 8)}] Error general en syncRecentChats:`, err.message);
-    return { error: err.message };
   }
+
+  log(accountId, `Chats extraídos: ${rawChats.length}`);
+
+  let totalSyncedChats = 0;
+  let totalSyncedMsgs = 0;
+  let totalSkipped = 0;
+
+  for (const raw of rawChats) {
+    try {
+      let phone = raw.phone;
+      if (!phone || phone.length >= 14 || raw.chatId?.includes('@lid')) {
+        phone = await resolveRealPhone(session, raw.chatId || `${phone}@lid`);
+      }
+      phone = normalizePhone(phone);
+      if (!phone || phone.length >= 14 || phone.length < 7) {
+        totalSkipped++;
+        continue;
+      }
+      if (!phone) continue;
+
+      const name = raw.name || `+${phone}`;
+
+      // Foto de perfil: usar la del evaluate o consultar con getContactAvatar
+      let avatarUrl = raw.avatarUrl || null;
+      if (!avatarUrl) {
+        avatarUrl = await getContactAvatar(session, raw.chatId);
+      }
+
+      // Obtener mensajes: si ya los tenemos del evaluate, usarlos; si no, fetchear
+      let validMessages = (raw.msgs || []).filter(m =>
+        (m.body?.trim() || m.hasMedia) && m.type !== 'revoked'
+      );
+
+      // Si el chat vino del fallback con _chatObj, fetchear mensajes
+      if (validMessages.length === 0 && raw._chatObj) {
+        try {
+          const fetched = await raw._chatObj.fetchMessages({ limit: msgsPerChat });
+          validMessages = fetched.filter(m => m.body?.trim() || m.hasMedia).map(m => ({
+            id: m.id?.id || m.id?._serialized,
+            body: m.body || '',
+            fromMe: !!m.fromMe,
+            timestamp: m.timestamp || 0,
+            type: m.type || 'chat',
+            hasMedia: !!m.hasMedia,
+          }));
+        } catch {}
+      }
+
+      if (validMessages.length === 0) { totalSkipped++; continue; }
+
+      validMessages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+      for (const msg of validMessages) {
+        const senderType = msg.fromMe ? 'agent' : 'customer';
+        const msgBody = msg.body?.trim() || (msg.hasMedia ? `[${msg.type || 'media'}]` : '');
+        const msgTimestamp = msg.timestamp
+          ? new Date(msg.timestamp * 1000).toISOString()
+          : new Date().toISOString();
+        const msgId = msg.id || `wa-hist-${msg.timestamp}-${phone}`;
+
+        if (msgId) session.recentProcessedIds.add(msgId);
+
+        const res = await saveMessage(session, {
+          phone, name, body: msgBody, mediaUrl: null,
+          messageId: msgId, senderType, avatarUrl,
+          createdAt: msgTimestamp, isHistoric: true,
+        });
+        if (res && !res.alreadyExists) totalSyncedMsgs++;
+      }
+
+      totalSyncedChats++;
+    } catch (chatError) {
+      console.error(`[WA][${accountId.slice(0, 8)}] Error sync chat:`, chatError.message);
+    }
+  }
+
+  log(accountId, `✅ Sync: ${totalSyncedChats} contactos, ${totalSyncedMsgs} mensajes nuevos, ${totalSkipped} omitidos.`);
+  // Iniciar backfill en segundo plano para cualquier contacto que aún no tenga foto
+  setTimeout(() => backfillContactAvatars(session), 2000);
+  return { syncedChats: totalSyncedChats, syncedMessages: totalSyncedMsgs, skipped: totalSkipped };
 }
 
 // ─── Polling de respaldo ───────────────────────────────────────────────────────
@@ -617,9 +848,10 @@ async function checkUnreadChats(session) {
 
       session.recentProcessedIds.add(item.messageId);
       const phone = await resolveRealPhone(session, item.chatId);
-      log(session.accountId, `📬 Detectado de +${phone}: "${item.body?.slice(0, 40)}"`);
+      const avatarUrl = await getContactAvatar(session, item.chatId);
+      log(session.accountId, `📬 Detectado de +${phone}: "${item.body?.slice(0, 40)}"${avatarUrl ? ' 🖼️' : ''}`);
 
-      const result = await saveMessage(session, { phone, name: item.name, body: item.body, messageId: item.messageId });
+      const result = await saveMessage(session, { phone, name: item.name, body: item.body, messageId: item.messageId, avatarUrl });
       if (result) {
         handleAiAutoReply(session, { conversationId: result.conversation.id, contactPhone: phone }).catch(() => {});
       }
@@ -676,12 +908,9 @@ function initSession(accountId) {
 
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: `saas-${accountId}` }),
-    webVersionCache: {
-      type: 'remote',
-      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1023054178-alpha.html',
-    },
     puppeteer: {
       headless: true,
+      protocolTimeout: 120_000,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -791,15 +1020,17 @@ function initSession(accountId) {
       session.recentProcessedIds.add(msg.id.id);
     }
 
-    const phone = await resolveRealPhone(session, msg.author || msg.from);
+    const chatId = msg.author || msg.from;
+    const phone = await resolveRealPhone(session, chatId);
     let name = null;
     try { const c = await msg.getContact(); name = c?.pushname || c?.name || null; } catch {}
+    const avatarUrl = await getContactAvatar(session, chatId);
 
     let mediaUrl = null;
     if (msg.hasMedia) { try { await msg.downloadMedia(); } catch {} }
 
-    log(accountId, `📨 De +${phone}: "${msg.body?.slice(0, 50)}"`);
-    const result = await saveMessage(session, { phone, name, body: msg.body, mediaUrl, messageId: msg.id.id });
+    log(accountId, `📨 De +${phone}: "${msg.body?.slice(0, 50)}"${avatarUrl ? ' 🖼️' : ''}`);
+    const result = await saveMessage(session, { phone, name, body: msg.body, mediaUrl, messageId: msg.id.id, avatarUrl });
     if (result) {
       handleAiAutoReply(session, { conversationId: result.conversation.id, contactPhone: phone }).catch(() => {});
     }
@@ -810,10 +1041,12 @@ function initSession(accountId) {
     if (msg.timestamp && msg.timestamp < session.readyTimestamp) return;
     if (session.recentSentIds.has(msg.id.id)) { session.recentSentIds.delete(msg.id.id); return; }
 
-    const phone = await resolveRealPhone(session, msg.to);
+    const chatId = msg.to;
+    const phone = await resolveRealPhone(session, chatId);
     let name = null;
     try { const c = await msg.getContact(); name = c?.pushname || c?.name || null; } catch {}
-    await saveMessage(session, { phone, name, body: msg.body, messageId: msg.id.id, senderType: 'agent' });
+    const avatarUrl = await getContactAvatar(session, chatId);
+    await saveMessage(session, { phone, name, body: msg.body, messageId: msg.id.id, senderType: 'agent', avatarUrl });
   });
 
   client.on('disconnected', (reason) => {
@@ -869,7 +1102,7 @@ async function loadAllSessions() {
   log(null, `Iniciando ${configs.length} sesión(es)...`);
   for (const cfg of configs) {
     initSession(cfg.account_id);
-    await new Promise(r => setTimeout(r, 3000)); // espaciar inicializaciones
+    await new Promise(r => setTimeout(r, 8000)); // espaciar inicializaciones (8s) para evitar contención de recursos
   }
 }
 
@@ -1017,6 +1250,15 @@ const server = http.createServer(async (req, res) => {
       const msgsPerChat = body.msgsPerChat || 50;
       const result = await syncRecentChats(session, maxChats, msgsPerChat);
       return json({ accountId, ...result });
+    }
+
+    // POST /sessions/:accountId/sync-avatars
+    if (req.method === 'POST' && sub === '/sync-avatars') {
+      const isConn = session?.status === 'ready' || session?.status === 'authenticated';
+      if (!isConn) return json({ error: 'WhatsApp no conectado', accountId, status: session?.status || 'not_started' }, 503);
+
+      backfillContactAvatars(session).catch(() => {});
+      return json({ accountId, status: 'syncing_avatars', message: 'Sincronización de fotos de perfil iniciada en segundo plano' });
     }
 
     // POST /sessions/:accountId/stop

@@ -178,16 +178,18 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
         <div className="p-4">
           {/* Contact Info */}
           <div className="flex flex-col items-center text-center">
-            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-muted text-lg font-semibold text-foreground">
+            <div className="relative flex h-16 w-16 items-center justify-center rounded-full bg-muted text-lg font-semibold text-foreground overflow-hidden">
               {contact.avatar_url ? (
                 <img
                   src={contact.avatar_url}
                   alt={displayName}
-                  className="h-16 w-16 rounded-full object-cover"
+                  className="h-full w-full object-cover"
+                  onError={(e) => {
+                    (e.currentTarget as HTMLElement).style.display = "none";
+                  }}
                 />
-              ) : (
-                initials
-              )}
+              ) : null}
+              <span className={contact.avatar_url ? "hidden" : ""}>{initials}</span>
             </div>
             <h3 className="mt-3 text-sm font-semibold text-foreground">
               {displayName}
