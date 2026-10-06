@@ -357,6 +357,8 @@ export async function sendMessageToConversation(
               to: phone,
               message: contentText || (messageType === 'template' ? `[Plantilla: ${templateName}]` : ''),
               mediaUrl: mediaUrl || undefined,
+              contentType: messageType,
+              sendAudioAsVoice: messageType === 'audio',
               fromCrm: true,
             }),
             signal: AbortSignal.timeout(15000),

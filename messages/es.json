@@ -1690,5 +1690,10 @@
       "reindexTooltip": "Volver a indexar todos los documentos para búsqueda semántica",
       "loading": "Cargando…"
     }
+  },
+  "Automations": {
+    "builder": {
+      "delete": "Eliminar"
+    }
   }
 }

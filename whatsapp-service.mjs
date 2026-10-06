@@ -291,6 +291,13 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
           body: JSON.stringify({ model: modelName, system: systemMsg, messages: chatMsgs, max_tokens: 450 }),
         });
         if (resp.ok) replyText = (await resp.json()).content?.[0]?.text?.trim() || '';
+      } else if (config.provider === 'gemini') {
+        const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+          body: JSON.stringify({ model: modelName || 'gemini-1.5-flash', messages, max_tokens: 450, temperature: 0.7 }),
+        });
+        if (resp.ok) replyText = (await resp.json()).choices?.[0]?.message?.content?.trim() || '';
       }
     } catch (err) {
       console.error(`[WA][${accountId.slice(0, 8)}] Error llamando a IA:`, err.message);
@@ -346,6 +353,119 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
   }
 }
 
+// ─── Subir archivos multimedia a Supabase Storage (chat-media) ───────────────
+async function uploadMediaToStorage(session, media, messageId) {
+  const { accountId } = session;
+  try {
+    if (!media || !media.data) return null;
+    const buffer = Buffer.from(media.data, 'base64');
+    const cleanMime = (media.mimetype || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+
+    let ext = 'bin';
+    if (cleanMime.includes('ogg')) ext = 'ogg';
+    else if (cleanMime.includes('mp4') || cleanMime.includes('m4a')) ext = cleanMime.startsWith('video') ? 'mp4' : 'm4a';
+    else if (cleanMime.includes('mpeg') || cleanMime.includes('mp3')) ext = 'mp3';
+    else if (cleanMime.includes('aac')) ext = 'aac';
+    else if (cleanMime.includes('wav')) ext = 'wav';
+    else if (cleanMime.includes('jpeg') || cleanMime.includes('jpg')) ext = 'jpg';
+    else if (cleanMime.includes('png')) ext = 'png';
+    else if (cleanMime.includes('webp')) ext = 'webp';
+    else if (cleanMime.includes('pdf')) ext = 'pdf';
+
+    const storagePath = `${accountId}/${messageId || Date.now()}.${ext}`;
+    const { error: upErr } = await supabase.storage
+      .from('chat-media')
+      .upload(storagePath, buffer, { contentType: cleanMime, upsert: true });
+
+    if (upErr) {
+      console.error(`[WA][${accountId.slice(0, 8)}] Error subiendo a storage:`, upErr.message);
+      return null;
+    }
+
+    const { data: pubData } = supabase.storage.from('chat-media').getPublicUrl(storagePath);
+    return pubData?.publicUrl || null;
+  } catch (err) {
+    console.error(`[WA][${accountId.slice(0, 8)}] Error uploadMediaToStorage:`, err.message);
+    return null;
+  }
+}
+
+// ─── Transcribir Audio / Notas de voz con Whisper (Groq / OpenAI) ─────────────
+async function transcribeAudio(session, audioBuffer, mimeType = 'audio/ogg') {
+  const { accountId } = session;
+  try {
+    let { data: config } = await supabase
+      .from('ai_configs')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('is_active', true)
+      .maybeSingle();
+
+    let apiKey = config?.api_key ? decryptKey(config.api_key) : null;
+    let provider = config?.provider;
+
+    // Fallback: si esta cuenta no tiene Groq u OpenAI configurado, buscar si otra cuenta tiene clave activa
+    if (!apiKey || (provider !== 'groq' && provider !== 'openai')) {
+      const { data: anyGroq } = await supabase
+        .from('ai_configs')
+        .select('*')
+        .in('provider', ['groq', 'openai'])
+        .eq('is_active', true)
+        .limit(1)
+        .maybeSingle();
+      if (anyGroq?.api_key) {
+        apiKey = decryptKey(anyGroq.api_key);
+        provider = anyGroq.provider;
+      }
+    }
+
+    if (!apiKey) {
+      log(accountId, '⚠️ No se encontró API key de Groq u OpenAI para transcribir la nota de voz.');
+      return null;
+    }
+
+    let cleanMime = (mimeType || 'audio/ogg').split(';')[0].trim().toLowerCase();
+    let ext = 'ogg';
+    if (cleanMime.includes('mp4') || cleanMime.includes('m4a')) ext = 'm4a';
+    else if (cleanMime.includes('mpeg') || cleanMime.includes('mp3')) ext = 'mp3';
+    else if (cleanMime.includes('wav')) ext = 'wav';
+    else if (cleanMime.includes('aac')) ext = 'aac';
+
+    let endpoint = 'https://api.groq.com/openai/v1/audio/transcriptions';
+    let model = 'whisper-large-v3-turbo';
+
+    if (provider === 'openai') {
+      endpoint = 'https://api.openai.com/v1/audio/transcriptions';
+      model = 'whisper-1';
+    }
+
+    const formData = new FormData();
+    const blob = new Blob([audioBuffer], { type: cleanMime });
+    formData.append('file', blob, `audio.${ext}`);
+    formData.append('model', model);
+    formData.append('response_format', 'json');
+
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: formData,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`[WA][${accountId.slice(0, 8)}] Error en transcripción Whisper (${res.status}):`, errText);
+      return null;
+    }
+
+    const json = await res.json();
+    const text = json.text?.trim() || null;
+    return text;
+  } catch (err) {
+    console.error(`[WA][${accountId.slice(0, 8)}] Error en transcribeAudio:`, err.message);
+    return null;
+  }
+}
+
 // ─── Guardar mensaje en Supabase (por sesión) ─────────────────────────────────
 async function resolveUserId(session) {
   if (session._userId) return session._userId;
@@ -357,7 +477,7 @@ async function resolveUserId(session) {
   return null;
 }
 
-async function saveMessage(session, { phone, name, body, mediaUrl, messageId, senderType = 'customer', avatarUrl = null, createdAt = null, isHistoric = false }) {
+async function saveMessage(session, { phone, name, body, mediaUrl, contentType = 'text', messageId, senderType = 'customer', avatarUrl = null, createdAt = null, isHistoric = false }) {
   const { accountId } = session;
   try {
     const cleanPhone = normalizePhone(phone);
@@ -393,6 +513,16 @@ async function saveMessage(session, { phone, name, body, mediaUrl, messageId, se
 
     const timestamp = createdAt || new Date().toISOString();
 
+    const validDbTypes = new Set(['text', 'image', 'document', 'audio', 'video', 'location', 'template']);
+    let finalContentType = contentType;
+    if (!validDbTypes.has(finalContentType)) {
+      finalContentType = mediaUrl ? 'audio' : 'text';
+    }
+
+    const defaultPlaceholder = finalContentType === 'audio' ? '[Nota de voz]' : (mediaUrl ? '[Archivo multimedia]' : '');
+    const contentText = body || defaultPlaceholder;
+    const previewText = finalContentType === 'audio' && body ? `🎙️ ${body}` : contentText;
+
     // Buscar o crear conversación (reusar cualquier conversación existente del contacto)
     let { data: conversation } = await supabase
       .from('conversations').select('id, last_message_at, unread_count, status')
@@ -405,7 +535,7 @@ async function saveMessage(session, { phone, name, body, mediaUrl, messageId, se
         .insert({
           account_id: accountId, user_id: userId, contact_id: contact.id,
           status: 'open', last_message_at: timestamp,
-          last_message_text: body?.slice(0, 255) || '',
+          last_message_text: previewText.slice(0, 255) || '',
           unread_count: (!isHistoric && senderType === 'customer') ? 1 : 0,
         })
         .select().single();
@@ -423,12 +553,11 @@ async function saveMessage(session, { phone, name, body, mediaUrl, messageId, se
       if (existingMsg) return { contact, conversation, alreadyExists: true };
     }
 
-    const contentText = body || (mediaUrl ? '[Archivo multimedia]' : '');
     const { error: msgErr } = await supabase.from('messages').insert({
       conversation_id: conversation.id,
       sender_type: senderType,
       sender_id: senderType === 'customer' ? contact.id : null,
-      content_type: mediaUrl ? 'media' : 'text',
+      content_type: finalContentType,
       content_text: contentText,
       media_url: mediaUrl || null,
       status: senderType === 'customer' ? 'delivered' : 'sent',
@@ -441,7 +570,7 @@ async function saveMessage(session, { phone, name, body, mediaUrl, messageId, se
     const convUpdates = {};
     if (!conversation.last_message_at || new Date(timestamp) >= new Date(conversation.last_message_at)) {
       convUpdates.last_message_at = timestamp;
-      convUpdates.last_message_text = contentText.slice(0, 255);
+      convUpdates.last_message_text = previewText.slice(0, 255);
     }
     // Incrementar unread solo para mensajes en tiempo real de clientes
     if (!isHistoric && senderType === 'customer') {
@@ -790,7 +919,15 @@ async function syncRecentChats(session, maxChats = 50, msgsPerChat = 30) {
 
       for (const msg of validMessages) {
         const senderType = msg.fromMe ? 'agent' : 'customer';
-        const msgBody = msg.body?.trim() || (msg.hasMedia ? `[${msg.type || 'media'}]` : '');
+        const isAudio = msg.type === 'ptt' || msg.type === 'audio';
+        let contentType = 'text';
+        if (isAudio) contentType = 'audio';
+        else if (msg.type === 'image') contentType = 'image';
+        else if (msg.type === 'video') contentType = 'video';
+        else if (msg.hasMedia) contentType = 'document';
+
+        const defaultText = isAudio ? '[Nota de voz]' : (msg.hasMedia ? `[${msg.type || 'media'}]` : '');
+        const msgBody = msg.body?.trim() || defaultText;
         const msgTimestamp = msg.timestamp
           ? new Date(msg.timestamp * 1000).toISOString()
           : new Date().toISOString();
@@ -799,7 +936,7 @@ async function syncRecentChats(session, maxChats = 50, msgsPerChat = 30) {
         if (msgId) session.recentProcessedIds.add(msgId);
 
         const res = await saveMessage(session, {
-          phone, name, body: msgBody, mediaUrl: null,
+          phone, name, body: msgBody, mediaUrl: null, contentType,
           messageId: msgId, senderType, avatarUrl,
           createdAt: msgTimestamp, isHistoric: true,
         });
@@ -887,15 +1024,15 @@ function initSession(accountId) {
   // Si ya hay una sesión corriendo o en proceso, no duplicar
   if (sessions.has(accountId)) {
     const existing = sessions.get(accountId);
-    if (existing.status === 'ready') {
+    if (existing.status === 'ready' && existing.client) {
       log(accountId, 'Sesión ya está lista, omitiendo init');
       return existing;
     }
-    if (existing.status === 'initializing' || existing.status === 'qr') {
+    if (existing.client && (existing.status === 'initializing' || existing.status === 'qr')) {
       log(accountId, `Sesión ya en proceso (${existing.status}), omitiendo duplicado`);
       return existing;
     }
-    // Si estaba en estado previo (error, stopped), limpiamos antes de recrear
+    // Si estaba en estado previo (error, stopped, o client null tras restart), limpiamos antes de recrear
     if (existing.client) {
       try { existing.client.destroy().catch(() => {}); } catch {}
       existing.client = null;
@@ -941,13 +1078,13 @@ function initSession(accountId) {
     // Arrancar modal-dismisser ANTES del ready para desbloquear pantallas intermedias
     startModalDismisser(session);
 
-    // Watchdog: si no llegamos a 'ready' en 90s, reiniciar sesión
+    // Watchdog: si no llegamos a 'ready' en 180s, reiniciar sesión
     const watchdog = setTimeout(() => {
       if (session.status !== 'ready') {
         log(accountId, '⚠️ Watchdog: sesión atascada en authenticated, reiniciando...');
         restartSession(session, 'watchdog_stuck_authenticated');
       }
-    }, 90_000);
+    }, 180_000);
     session._authWatchdog = watchdog;
   });
 
@@ -1027,10 +1164,51 @@ function initSession(accountId) {
     const avatarUrl = await getContactAvatar(session, chatId);
 
     let mediaUrl = null;
-    if (msg.hasMedia) { try { await msg.downloadMedia(); } catch {} }
+    let contentType = 'text';
+    let body = msg.body?.trim() || '';
 
-    log(accountId, `📨 De +${phone}: "${msg.body?.slice(0, 50)}"${avatarUrl ? ' 🖼️' : ''}`);
-    const result = await saveMessage(session, { phone, name, body: msg.body, mediaUrl, messageId: msg.id.id, avatarUrl });
+    if (msg.hasMedia) {
+      try {
+        const media = await msg.downloadMedia();
+        if (media && media.data) {
+          mediaUrl = await uploadMediaToStorage(session, media, msg.id.id);
+          const cleanMime = (media.mimetype || '').split(';')[0].trim().toLowerCase();
+          const isAudio = msg.type === 'ptt' || msg.type === 'audio' || cleanMime.startsWith('audio');
+
+          if (isAudio) {
+            contentType = 'audio';
+            const audioBuffer = Buffer.from(media.data, 'base64');
+            log(accountId, `🎙️ Transcribiendo nota de voz (+${phone}) con Whisper...`);
+            const transcript = await transcribeAudio(session, audioBuffer, cleanMime);
+            if (transcript) {
+              body = transcript;
+              log(accountId, `📝 Transcripción (+${phone}): "${transcript.slice(0, 60)}..."`);
+            } else {
+              body = body || '[Nota de voz]';
+            }
+          } else if (cleanMime.startsWith('image')) {
+            contentType = 'image';
+          } else if (cleanMime.startsWith('video')) {
+            contentType = 'video';
+          } else {
+            contentType = 'document';
+          }
+        }
+      } catch (mediaErr) {
+        console.error(`[WA][${accountId.slice(0, 8)}] Error descargando multimedia:`, mediaErr.message);
+      }
+    }
+
+    log(accountId, `📨 De +${phone}: "${body?.slice(0, 50)}"${avatarUrl ? ' 🖼️' : ''}${contentType === 'audio' ? ' 🎙️' : ''}`);
+    const result = await saveMessage(session, {
+      phone,
+      name,
+      body,
+      mediaUrl,
+      contentType,
+      messageId: msg.id.id,
+      avatarUrl,
+    });
     if (result) {
       handleAiAutoReply(session, { conversationId: result.conversation.id, contactPhone: phone }).catch(() => {});
     }
@@ -1046,7 +1224,48 @@ function initSession(accountId) {
     let name = null;
     try { const c = await msg.getContact(); name = c?.pushname || c?.name || null; } catch {}
     const avatarUrl = await getContactAvatar(session, chatId);
-    await saveMessage(session, { phone, name, body: msg.body, messageId: msg.id.id, senderType: 'agent', avatarUrl });
+
+    let mediaUrl = null;
+    let contentType = 'text';
+    let body = msg.body?.trim() || '';
+
+    if (msg.hasMedia) {
+      try {
+        const media = await msg.downloadMedia();
+        if (media && media.data) {
+          mediaUrl = await uploadMediaToStorage(session, media, msg.id.id);
+          const cleanMime = (media.mimetype || '').split(';')[0].trim().toLowerCase();
+          const isAudio = msg.type === 'ptt' || msg.type === 'audio' || cleanMime.startsWith('audio');
+
+          if (isAudio) {
+            contentType = 'audio';
+            const audioBuffer = Buffer.from(media.data, 'base64');
+            const transcript = await transcribeAudio(session, audioBuffer, cleanMime);
+            if (transcript) body = transcript;
+            else body = body || '[Nota de voz]';
+          } else if (cleanMime.startsWith('image')) {
+            contentType = 'image';
+          } else if (cleanMime.startsWith('video')) {
+            contentType = 'video';
+          } else {
+            contentType = 'document';
+          }
+        }
+      } catch (mediaErr) {
+        console.error(`[WA][${accountId.slice(0, 8)}] Error descargando multimedia agente:`, mediaErr.message);
+      }
+    }
+
+    await saveMessage(session, {
+      phone,
+      name,
+      body,
+      mediaUrl,
+      contentType,
+      messageId: msg.id.id,
+      senderType: 'agent',
+      avatarUrl,
+    });
   });
 
   client.on('disconnected', (reason) => {
@@ -1067,13 +1286,13 @@ function initSession(accountId) {
 async function restartSession(session, reason) {
   if (session.isRestarting) return;
   session.isRestarting = true;
-  log(session.accountId, `🔄 Reiniciando (${reason})...`);
+  const accId = session.accountId;
+  log(accId, `🔄 Reiniciando (${reason})...`);
   try { if (session.client) await session.client.destroy().catch(() => {}); } catch {}
   session.client = null;
-  session.status = 'initializing';
+  sessions.delete(accId);
   setTimeout(() => {
-    session.isRestarting = false;
-    initSession(session.accountId);
+    initSession(accId);
   }, 5000);
 }
 
@@ -1093,13 +1312,14 @@ async function loadAllSessions() {
   log(null, 'Cargando sesiones activas desde Supabase...');
   const { data: configs, error } = await supabase
     .from('whatsapp_config')
-    .select('account_id, status')
+    .select('account_id, status, waba_id')
+    .eq('waba_id', 'whatsapp_web')
     .in('status', ['connected', 'qr', 'authenticated']);
 
   if (error) { console.error('[WA-Service] Error:', error.message); return; }
   if (!configs?.length) { log(null, 'Sin sesiones activas — esperando activaciones vía POST /sessions/:accountId/start'); return; }
 
-  log(null, `Iniciando ${configs.length} sesión(es)...`);
+  log(null, `Iniciando ${configs.length} sesión(es) de WhatsApp Web...`);
   for (const cfg of configs) {
     initSession(cfg.account_id);
     await new Promise(r => setTimeout(r, 8000)); // espaciar inicializaciones (8s) para evitar contención de recursos
@@ -1275,7 +1495,8 @@ const server = http.createServer(async (req, res) => {
       req.on('data', c => body += c);
       req.on('end', async () => {
         try {
-          const { to, message, mediaUrl, fromCrm } = JSON.parse(body);
+          const reqData = JSON.parse(body);
+          const { to, message, mediaUrl, fromCrm, contentType, sendAudioAsVoice } = reqData;
           if (!to || (!message && !mediaUrl)) return json({ error: 'Faltan parámetros: to, message' }, 400);
 
           const digits = normalizePhone(to);
@@ -1286,7 +1507,11 @@ const server = http.createServer(async (req, res) => {
           let msgResult;
           if (mediaUrl) {
             const media = await MessageMedia.fromUrl(mediaUrl);
-            msgResult = await session.client.sendMessage(chatId, media, { caption: message || '' });
+            const isVoice = !!sendAudioAsVoice || contentType === 'audio' || media.mimetype?.includes('audio') || media.mimetype?.includes('ogg');
+            msgResult = await session.client.sendMessage(chatId, media, {
+              caption: message || '',
+              sendAudioAsVoice: isVoice,
+            });
           } else {
             msgResult = await session.client.sendMessage(chatId, message);
           }
@@ -1295,7 +1520,7 @@ const server = http.createServer(async (req, res) => {
           if (msgResult?.id?.id) session.recentSentIds.add(msgResult.id.id);
 
           if (!fromCrm) {
-            await saveMessage(session, { phone: digits, body: message, mediaUrl, messageId, senderType: 'agent' });
+            await saveMessage(session, { phone: digits, body: message, mediaUrl, contentType, messageId, senderType: 'agent' });
           }
 
           json({ success: true, messageId });
