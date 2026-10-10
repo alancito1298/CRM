@@ -54,11 +54,15 @@ function createSessionState(accountId) {
   return {
     accountId,
     client: null,
-    status: 'initializing', // initializing | qr | authenticated | ready | error | stopped
+    status: 'initializing', // initializing | qr | pairing_code | authenticated | ready | error | stopped
     qr: null,
+    pairingCode: null,
+    requestedPairingPhone: null,
     phone: null,
     readyTimestamp: Math.floor(Date.now() / 1000) - 120,
     isRestarting: false,
+    restartAttempts: 0,
+    lastRestartAt: 0,
     recentSentIds: new Set(),
     recentProcessedIds: new Set(),
   };
@@ -1020,15 +1024,18 @@ function startModalDismisser(session) {
 }
 
 // ─── Iniciar sesión para una cuenta ───────────────────────────────────────────
-function initSession(accountId) {
+function initSession(accountId, { pairingPhone } = {}) {
   // Si ya hay una sesión corriendo o en proceso, no duplicar
   if (sessions.has(accountId)) {
     const existing = sessions.get(accountId);
+    if (pairingPhone) {
+      existing.requestedPairingPhone = pairingPhone;
+    }
     if (existing.status === 'ready' && existing.client) {
       log(accountId, 'Sesión ya está lista, omitiendo init');
       return existing;
     }
-    if (existing.client && (existing.status === 'initializing' || existing.status === 'qr')) {
+    if (existing.client && (existing.status === 'initializing' || existing.status === 'qr' || existing.status === 'pairing_code')) {
       log(accountId, `Sesión ya en proceso (${existing.status}), omitiendo duplicado`);
       return existing;
     }
@@ -1040,6 +1047,9 @@ function initSession(accountId) {
   }
 
   const session = createSessionState(accountId);
+  if (pairingPhone) {
+    session.requestedPairingPhone = pairingPhone;
+  }
   sessions.set(accountId, session);
   log(accountId, '🚀 Iniciando sesión...');
 
@@ -1063,16 +1073,36 @@ function initSession(accountId) {
   });
   session.client = client;
 
-  client.on('qr', (qr) => {
+  client.on('qr', async (qr) => {
     session.qr = qr;
+    if (session.requestedPairingPhone && !session.pairingCode) {
+      try {
+        log(accountId, `📱 Solicitando código de vinculación para ${session.requestedPairingPhone}...`);
+        const code = await client.requestPairingCode(session.requestedPairingPhone);
+        session.pairingCode = code;
+        session.status = 'pairing_code';
+        log(accountId, `🔑 Pairing Code recibido: ${code}`);
+        return;
+      } catch (err) {
+        log(accountId, `⚠️ Error generando pairing code automático: ${err.message}`);
+      }
+    }
     session.status = 'qr';
     log(accountId, `QR listo → GET /sessions/${accountId}/qr`);
     supabase.from('whatsapp_config').update({ status: 'qr', updated_at: new Date().toISOString() }).eq('account_id', accountId).then(() => {});
   });
 
+  client.on('code', (code) => {
+    session.pairingCode = code;
+    session.status = 'pairing_code';
+    log(accountId, `🔑 Código de vinculación recibido/actualizado: ${code}`);
+  });
+
   client.on('authenticated', () => {
     session.status = 'authenticated';
     session.qr = null;
+    session.pairingCode = null;
+    session.requestedPairingPhone = null;
     log(accountId, '✅ Autenticado');
 
     // Arrancar modal-dismisser ANTES del ready para desbloquear pantallas intermedias
@@ -1287,13 +1317,25 @@ async function restartSession(session, reason) {
   if (session.isRestarting) return;
   session.isRestarting = true;
   const accId = session.accountId;
-  log(accId, `🔄 Reiniciando (${reason})...`);
+  const now = Date.now();
+
+  // Cooldown de reinicio exponencial si falla continuamente
+  if (now - (session.lastRestartAt || 0) < 60_000) {
+    session.restartAttempts = (session.restartAttempts || 0) + 1;
+  } else {
+    session.restartAttempts = 1;
+  }
+  session.lastRestartAt = now;
+
+  const delay = session.restartAttempts > 3 ? 30_000 : 5_000;
+  log(accId, `🔄 Reiniciando (${reason}) en ${delay / 1000}s (intento ${session.restartAttempts})...`);
+
   try { if (session.client) await session.client.destroy().catch(() => {}); } catch {}
   session.client = null;
   sessions.delete(accId);
   setTimeout(() => {
     initSession(accId);
-  }, 5000);
+  }, delay);
 }
 
 async function stopSession(accountId) {
@@ -1370,12 +1412,13 @@ const server = http.createServer(async (req, res) => {
 
     // GET /sessions/:accountId/status
     if (req.method === 'GET' && sub === '/status') {
-      if (!session) return json({ accountId, status: 'disconnected', qr: null, phone: null });
+      if (!session) return json({ accountId, status: 'disconnected', qr: null, phone: null, pairingCode: null });
       return json({
         accountId,
         status: session.status,
         phone: session.phone || null,
         qr: session.qr || null,
+        pairingCode: session.pairingCode || null,
       });
     }
 
@@ -1385,13 +1428,15 @@ const server = http.createServer(async (req, res) => {
         accountId,
         status: session?.status || 'disconnected',
         qr: session?.qr || null,
+        pairingCode: session?.pairingCode || null,
         phone: session?.phone || null,
       });
     }
 
-    // GET /sessions/:accountId/qr — página HTML con QR
+    // GET /sessions/:accountId/qr — página HTML con QR o Pairing Code
     if (req.method === 'GET' && sub === '/qr') {
       const isReady = session?.status === 'ready' || session?.status === 'authenticated';
+      const hasPairing = session?.status === 'pairing_code' && session?.pairingCode;
       const hasQr = session?.status === 'qr' && session?.qr;
       const qrImg = hasQr ? await qrcode.toDataURL(session.qr, { width: 280, margin: 2 }) : null;
 
@@ -1413,24 +1458,94 @@ const server = http.createServer(async (req, res) => {
     .step{display:flex;gap:10px;align-items:center;padding:6px 0;font-size:13px;color:#cbd5e1}
     .n{background:#25d366;border-radius:50%;width:22px;height:22px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:11px;flex-shrink:0}
   </style>
-  <script>setInterval(async()=>{const r=await fetch('/sessions/${accountId}/status');const d=await r.json();if(['ready','qr'].includes(d.status))location.reload();},3000)</script>
+  <script>setInterval(async()=>{const r=await fetch('/sessions/${accountId}/status');const d=await r.json();if(['ready','qr','pairing_code'].includes(d.status))location.reload();},3000)</script>
 </head><body><div class="card">
   <div style="font-size:44px;margin-bottom:12px">💬</div>
   <h1>Conectar WhatsApp</h1>
   ${isReady
     ? `<div class="ready">✅ Conectado<br><span style="font-size:13px;font-weight:400;color:#86efac;margin-top:6px;display:block">${session.phone || ''}</span></div>`
-    : hasQr
-      ? `<p>Escaneá con tu celular para conectar esta cuenta</p>
-         <div class="qr"><img src="${qrImg}" width="248" height="248"/></div>
+    : hasPairing
+      ? `<p>Ingresá este código en tu WhatsApp:</p>
+         <div style="font-size:36px;letter-spacing:6px;font-weight:800;color:#25d366;background:rgba(37,211,102,.12);padding:18px 24px;border-radius:16px;border:2px dashed #25d366;font-family:monospace;margin-bottom:24px;display:inline-block">${session.pairingCode}</div>
          <div class="steps">
            <div class="step"><span class="n">1</span>Abrí WhatsApp en tu celular</div>
            <div class="step"><span class="n">2</span>Tocá ⋮ → Dispositivos vinculados</div>
            <div class="step"><span class="n">3</span>Tocá "Vincular dispositivo"</div>
-           <div class="step"><span class="n">4</span>Apuntá la cámara al QR</div>
+           <div class="step"><span class="n">4</span>Tocá "Vincular con el número de teléfono"</div>
+           <div class="step"><span class="n">5</span>Escribí el código de 8 caracteres</div>
          </div>`
-      : `<div class="waiting"><div class="spinner"></div>Iniciando... (${session?.status || 'no iniciado'})</div>`
+      : hasQr
+        ? `<p>Escaneá con tu celular para conectar esta cuenta</p>
+           <div class="qr"><img src="${qrImg}" width="248" height="248"/></div>
+           <div class="steps">
+             <div class="step"><span class="n">1</span>Abrí WhatsApp en tu celular</div>
+             <div class="step"><span class="n">2</span>Tocá ⋮ → Dispositivos vinculados</div>
+             <div class="step"><span class="n">3</span>Tocá "Vincular dispositivo"</div>
+             <div class="step"><span class="n">4</span>Apuntá la cámara al QR</div>
+           </div>`
+        : `<div class="waiting"><div class="spinner"></div>Iniciando... (${session?.status || 'no iniciado'})</div>`
   }
 </div></body></html>`);
+    }
+
+    // POST /sessions/:accountId/pairing-code — Vincular con código telefónico de 8 dígitos
+    if (req.method === 'POST' && sub === '/pairing-code') {
+      const body = await new Promise(resolve => {
+        let raw = '';
+        req.on('data', c => raw += c);
+        req.on('end', () => { try { resolve(JSON.parse(raw)); } catch { resolve({}); } });
+      });
+      const rawPhone = body?.phone;
+      if (!rawPhone) return json({ error: 'Falta el parámetro phone' }, 400);
+      const cleanPhone = normalizePhone(rawPhone);
+      if (!cleanPhone || cleanPhone.length < 8) {
+        return json({ error: 'Número de teléfono inválido (debe incluir código de país, ej. 54911...)' }, 400);
+      }
+
+      let s = sessions.get(accountId);
+      if (!s || !s.client) {
+        s = initSession(accountId, { pairingPhone: cleanPhone });
+        return json({
+          accountId,
+          status: 'initializing',
+          message: 'Iniciando navegador virtual para generar código de vinculación...',
+        });
+      }
+
+      s.requestedPairingPhone = cleanPhone;
+      if (s.status === 'ready' || s.status === 'authenticated') {
+        return json({ accountId, status: s.status, phone: s.phone, message: 'La sesión ya está conectada' });
+      }
+
+      try {
+        if (typeof s.client.requestPairingCode === 'function') {
+          log(accountId, `📱 Solicitando pairing code a WhatsApp Web para ${cleanPhone}...`);
+          const code = await s.client.requestPairingCode(cleanPhone);
+          s.pairingCode = code;
+          s.status = 'pairing_code';
+          log(accountId, `🔑 Pairing Code recibido: ${code}`);
+          return json({ accountId, status: 'pairing_code', pairingCode: code });
+        } else {
+          return json({ error: 'Tu versión de WhatsApp Web no soporta pairing code' }, 500);
+        }
+      } catch (err) {
+        log(accountId, `⚠️ Error en requestPairingCode: ${err.message}`);
+        return json({ error: `Error solicitando código: ${err.message}`, status: s.status }, 500);
+      }
+    }
+
+    // POST /sessions/:accountId/pairing-code/cancel
+    if (req.method === 'POST' && sub === '/pairing-code/cancel') {
+      const s = sessions.get(accountId);
+      if (s) {
+        s.pairingCode = null;
+        s.requestedPairingPhone = null;
+        if (s.client && typeof s.client.cancelPairingCode === 'function') {
+          try { await s.client.cancelPairingCode(); } catch {}
+        }
+        s.status = s.qr ? 'qr' : 'initializing';
+      }
+      return json({ accountId, status: s?.status || 'disconnected' });
     }
 
     // POST /sessions/:accountId/start
@@ -1580,4 +1695,26 @@ server.listen(PORT, async () => {
   console.log(`📋 Dashboard: http://localhost:${PORT}/`);
   console.log(`📡 API: POST /sessions/:accountId/start\n`);
   await loadAllSessions();
+});
+
+// ─── Proceso y Cierre Limpio (Graceful Shutdown) ──────────────────────────────
+const gracefulExit = async () => {
+  console.log('\n[WA-Service] 🛑 Deteniendo servicio y cerrando navegadores Puppeteer...');
+  for (const [id, s] of sessions.entries()) {
+    try {
+      if (s.client) await s.client.destroy().catch(() => {});
+    } catch {}
+  }
+  process.exit(0);
+};
+
+process.on('SIGINT', gracefulExit);
+process.on('SIGTERM', gracefulExit);
+
+process.on('unhandledRejection', (reason) => {
+  console.warn('[WA-Service] ⚠️ Unhandled Rejection:', reason?.message || reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[WA-Service] ❌ Uncaught Exception:', err?.message || err);
 });

@@ -259,37 +259,38 @@ export async function sendMessageToConversation(
     );
   }
 
-  // WhatsApp config, account-scoped.
-  const { data: config, error: configError } = await db
+  // WhatsApp config, account-scoped (Meta Cloud API).
+  // Optional when the account is connected via WhatsApp Web (QR) or Twilio.
+  const { data: config } = await db
     .from('whatsapp_config')
     .select('*')
     .eq('account_id', accountId)
-    .single();
+    .maybeSingle();
 
-  if (configError || !config) {
-    throw new SendMessageError(
-      'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
-      400
-    );
-  }
+  let accessToken: string | null = null;
+  if (config?.access_token) {
+    try {
+      accessToken = decrypt(config.access_token);
 
-  const accessToken = decrypt(config.access_token);
-
-  // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
-  if (isLegacyFormat(config.access_token)) {
-    void db
-      .from('whatsapp_config')
-      .update({ access_token: encrypt(accessToken) })
-      .eq('id', config.id)
-      .then(({ error }: { error: { message: string } | null }) => {
-        if (error) {
-          console.warn(
-            '[send-message] access_token GCM upgrade failed:',
-            error.message
-          );
-        }
-      });
+      // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
+      if (isLegacyFormat(config.access_token) && accessToken) {
+        void db
+          .from('whatsapp_config')
+          .update({ access_token: encrypt(accessToken) })
+          .eq('id', config.id)
+          .then(({ error }: { error: { message: string } | null }) => {
+            if (error) {
+              console.warn(
+                '[send-message] access_token GCM upgrade failed:',
+                error.message
+              );
+            }
+          });
+      }
+    } catch (decryptErr) {
+      console.warn('[send-message] access_token decryption failed:', decryptErr);
+      accessToken = null;
+    }
   }
 
   // Resolve the reply target to its Meta message_id. The parent must
@@ -409,6 +410,15 @@ export async function sendMessageToConversation(
       return result.messageSid;
     }
 
+    // ── 3. Meta Cloud API (Oficial) ──
+    if (!config || !config.phone_number_id || !accessToken) {
+      throw new SendMessageError(
+        'whatsapp_not_configured',
+        'WhatsApp no está conectado ni configurado. Conecta tu WhatsApp escaneando el código QR en Ajustes o configura tus credenciales de Meta Cloud API.',
+        400
+      );
+    }
+
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
         phoneNumberId: config.phone_number_id,
@@ -490,6 +500,9 @@ export async function sendMessageToConversation(
         lastError = null;
         break;
       } catch (err) {
+        if (err instanceof SendMessageError) {
+          throw err;
+        }
         const message = err instanceof Error ? err.message : String(err);
         if (!isRecipientNotAllowedError(message)) {
           throw err;
@@ -503,6 +516,9 @@ export async function sendMessageToConversation(
 
     if (lastError) throw lastError;
   } catch (err) {
+    if (err instanceof SendMessageError) {
+      throw err;
+    }
     const message =
       err instanceof Error ? err.message : 'Unknown Meta API error';
     console.error('[send-message] Meta send failed for all variants:', message);

@@ -31,6 +31,7 @@ import type { AiProvider } from '@/lib/ai/types';
 import type { AccountMember } from '@/types';
 import { fetchAccountMembers, memberLabel } from '@/lib/account/members';
 import { useTranslations } from 'next-intl';
+import { AiOnboardingModal } from '@/components/onboarding/ai-onboarding-modal';
 
 const MASKED_KEY = '••••••••••••••••';
 
@@ -113,6 +114,7 @@ export function AiConfig() {
   // Empty string = leave unassigned (shared queue).
   const [handoffAgentId, setHandoffAgentId] = useState('');
   const [members, setMembers] = useState<AccountMember[]>([]);
+  const [questionnaireOpen, setQuestionnaireOpen] = useState(false);
 
   // Guard keyed on the account (not a bare boolean) so an in-place
   // account switch — ownership transfer, multi-account membership —
@@ -511,11 +513,25 @@ export function AiConfig() {
         </Card>
 
         <Card>
-          <CardHeader>
-            <CardTitle className="text-base">{t('behaviour')}</CardTitle>
-            <CardDescription>
-              {t('behaviourDesc')}
-            </CardDescription>
+          <CardHeader className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <CardTitle className="text-base">{t('behaviour')}</CardTitle>
+              <CardDescription>
+                {t('behaviourDesc')}
+              </CardDescription>
+            </div>
+            {canEdit && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setQuestionnaireOpen(true)}
+                className="gap-1.5 text-xs border-primary/40 text-primary hover:bg-primary/10 shrink-0"
+              >
+                <Sparkles className="size-3.5" />
+                Asistente de Cuestionario
+              </Button>
+            )}
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2">
@@ -650,6 +666,12 @@ export function AiConfig() {
           </Button>
         </div>
       </div>
+
+      <AiOnboardingModal
+        open={questionnaireOpen}
+        onOpenChange={setQuestionnaireOpen}
+        onSuccess={fetchConfig}
+      />
     </div>
   );
 }

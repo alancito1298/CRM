@@ -16,6 +16,10 @@ import {
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
 import { supabaseAdmin } from './admin-client'
+import {
+  isWaWebSessionReady,
+  sendViaWaWebService,
+} from '@/lib/whatsapp/wa-web-sender'
 
 // ------------------------------------------------------------
 // Flows-side Meta sender (interactive variants).
@@ -82,64 +86,53 @@ export async function engineSendText(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  // ── WhatsApp Web Service (localhost:3001) — gratis, sin API externa ──
-  try {
-    const waServiceUrl = process.env.WA_SERVICE_URL || 'http://localhost:3001'
-    const statusRes = await fetch(`${waServiceUrl}/status`, { signal: AbortSignal.timeout(2000) })
-    if (statusRes.ok) {
-      const { status: waStatus } = (await statusRes.json()) as { status: string }
-      if (waStatus === 'ready') {
-        const sendRes = await fetch(`${waServiceUrl}/send`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            to: contact.phone,
-            message: args.text,
-            fromCrm: true,
-          }),
-          signal: AbortSignal.timeout(15000),
-        })
-        if (sendRes.ok) {
-          const data = (await sendRes.json()) as { messageId?: string }
-          const waMessageId = data.messageId || `wa-web-${Date.now()}`
+  // ── 1. WhatsApp Web Service (multi-tenant) ──
+  const { ready: waWebReady } = await isWaWebSessionReady(args.accountId)
+  if (waWebReady) {
+    const sendResult = await sendViaWaWebService({
+      accountId: args.accountId,
+      to: contact.phone,
+      message: args.text,
+      contentType: 'text',
+    })
+    if (sendResult.success) {
+      const waMessageId = sendResult.messageId || `wa-web-${Date.now()}`
 
-          const { error: msgErr } = await db.from('messages').insert({
-            conversation_id: args.conversationId,
-            sender_type: 'bot',
-            content_type: 'text',
-            content_text: args.text,
-            message_id: waMessageId,
-            status: 'sent',
-            ai_generated: args.aiGenerated ?? false,
-          })
-          if (msgErr) {
-            console.error('[engineSendText] DB insert failed:', msgErr.message)
-          }
-
-          await db
-            .from('conversations')
-            .update({
-              last_message_text: args.text,
-              last_message_at: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', args.conversationId)
-
-          return { whatsapp_message_id: waMessageId }
-        }
+      const { error: msgErr } = await db.from('messages').insert({
+        conversation_id: args.conversationId,
+        sender_type: 'bot',
+        content_type: 'text',
+        content_text: args.text,
+        message_id: waMessageId,
+        status: 'sent',
+        ai_generated: args.aiGenerated ?? false,
+      })
+      if (msgErr) {
+        console.error('[engineSendText] DB insert failed:', msgErr.message)
       }
+
+      await db
+        .from('conversations')
+        .update({
+          last_message_text: args.text,
+          last_message_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', args.conversationId)
+
+      return { whatsapp_message_id: waMessageId }
     }
-  } catch {
-    // Local service not ready, fall back to Meta
   }
 
-  const { data: config, error: configErr } = await db
+  // ── 2. Meta Cloud API (Oficial) ──
+  const { data: config } = await db
     .from('whatsapp_config')
     .select('*')
     .eq('account_id', args.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
+    .maybeSingle()
+
+  if (!config || !config.phone_number_id || !config.access_token) {
+    throw new Error('WhatsApp no está conectado ni configurado para esta cuenta')
   }
 
   const accessToken = decrypt(config.access_token)
@@ -243,13 +236,51 @@ export async function engineSendMedia(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
+  // ── 1. WhatsApp Web Service (multi-tenant) ──
+  const { ready: waWebReady } = await isWaWebSessionReady(args.accountId)
+  if (waWebReady) {
+    const sendResult = await sendViaWaWebService({
+      accountId: args.accountId,
+      to: contact.phone,
+      message: args.caption || '',
+      mediaUrl: args.link,
+      contentType: args.kind,
+    })
+    if (sendResult.success) {
+      const waMessageId = sendResult.messageId || `wa-web-${Date.now()}`
+      const preview = args.caption?.trim() || `[${args.kind}]`
+
+      await db.from('messages').insert({
+        conversation_id: args.conversationId,
+        sender_type: 'bot',
+        content_type: args.kind,
+        content_text: args.caption ?? null,
+        media_url: args.link,
+        message_id: waMessageId,
+        status: 'sent',
+      })
+
+      await db
+        .from('conversations')
+        .update({
+          last_message_text: preview,
+          last_message_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', args.conversationId)
+
+      return { whatsapp_message_id: waMessageId }
+    }
+  }
+
+  // ── 2. Meta Cloud API ──
+  const { data: config } = await db
     .from('whatsapp_config')
     .select('*')
     .eq('account_id', args.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
+    .maybeSingle()
+  if (!config || !config.phone_number_id || !config.access_token) {
+    throw new Error('WhatsApp no está conectado ni configurado para esta cuenta')
   }
 
   const accessToken = decrypt(config.access_token)
@@ -395,13 +426,89 @@ async function sendInteractiveViaMeta(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
+  // ── 1. WhatsApp Web Service (multi-tenant) ──
+  const { ready: waWebReady } = await isWaWebSessionReady(input.accountId)
+  if (waWebReady) {
+    // Formatear botones o lista como mensaje de texto interactivo para WhatsApp Web
+    let formattedText = ''
+    if (input.headerText) formattedText += `*${input.headerText}*\n\n`
+    formattedText += input.bodyText + '\n\n'
+
+    if (input.kind === 'buttons') {
+      input.buttons.forEach((b, i) => {
+        formattedText += `${i + 1}️⃣ *${b.title}*\n`
+      })
+      formattedText += '\n_Responde con el número o nombre de tu opción_'
+    } else {
+      input.sections.forEach((sec) => {
+        if (sec.title) formattedText += `📂 *${sec.title}*\n`
+        sec.rows.forEach((r, i) => {
+          formattedText += `• *${r.title}*${r.description ? ` (${r.description})` : ''}\n`
+        })
+      })
+      formattedText += '\n_Responde con la opción deseada_'
+    }
+    if (input.footerText) formattedText += `\n\n_${input.footerText}_`
+
+    const sendResult = await sendViaWaWebService({
+      accountId: input.accountId,
+      to: contact.phone,
+      message: formattedText,
+      contentType: 'interactive',
+    })
+
+    if (sendResult.success) {
+      const waMessageId = sendResult.messageId || `wa-web-${Date.now()}`
+
+      const interactivePayload: InteractiveMessagePayload =
+        input.kind === 'buttons'
+          ? {
+              kind: 'buttons',
+              body: input.bodyText,
+              header: input.headerText,
+              footer: input.footerText,
+              buttons: input.buttons,
+            }
+          : {
+              kind: 'list',
+              body: input.bodyText,
+              button_label: input.buttonLabel,
+              header: input.headerText,
+              footer: input.footerText,
+              sections: input.sections,
+            }
+
+      await db.from('messages').insert({
+        conversation_id: input.conversationId,
+        sender_type: 'bot',
+        content_type: 'interactive',
+        content_text: input.bodyText,
+        interactive_payload: interactivePayload,
+        message_id: waMessageId,
+        status: 'sent',
+      })
+
+      await db
+        .from('conversations')
+        .update({
+          last_message_text: input.bodyText,
+          last_message_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', input.conversationId)
+
+      return { whatsapp_message_id: waMessageId }
+    }
+  }
+
+  // ── 2. Meta Cloud API ──
+  const { data: config } = await db
     .from('whatsapp_config')
     .select('*')
     .eq('account_id', input.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
+    .maybeSingle()
+  if (!config || !config.phone_number_id || !config.access_token) {
+    throw new Error('WhatsApp no está conectado ni configurado para esta cuenta')
   }
 
   const accessToken = decrypt(config.access_token)

@@ -42,16 +42,27 @@ export async function POST(request: Request) {
     const accountId = ctx.accountId;
 
     const body = (await request.json().catch(() => ({}))) as {
-      action?: 'start' | 'stop' | 'restart';
+      action?: 'start' | 'stop' | 'restart' | 'pairing-code' | 'cancel-pairing-code';
+      phone?: string;
     };
 
     const action = body.action || 'start';
 
     try {
-      const endpoint = `${WA_SERVICE_URL}/sessions/${accountId}/${action}`;
+      let endpoint = `${WA_SERVICE_URL}/sessions/${accountId}/${action}`;
+      let reqBody: any = {};
+
+      if (action === 'pairing-code') {
+        endpoint = `${WA_SERVICE_URL}/sessions/${accountId}/pairing-code`;
+        reqBody = { phone: body.phone };
+      } else if (action === 'cancel-pairing-code') {
+        endpoint = `${WA_SERVICE_URL}/sessions/${accountId}/pairing-code/cancel`;
+      }
+
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(reqBody),
       });
 
       const data = await res.json();

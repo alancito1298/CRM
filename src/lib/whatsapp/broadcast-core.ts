@@ -66,12 +66,14 @@ export interface BroadcastPlan {
   broadcastId: string;
   templateName: string;
   templateLanguage: string;
-  phoneNumberId: string;
-  accessToken: string;
+  phoneNumberId?: string;
+  accessToken?: string;
   templateRow: MessageTemplate | null;
   planned: PlannedRecipient[];
   /** Phones rejected up front (invalid E.164) — counted as failed. */
   rejected: number;
+  accountId: string;
+  isWaWeb?: boolean;
 }
 
 const MAX_RECIPIENTS = 1000;
@@ -109,21 +111,48 @@ export async function createBroadcast(
     );
   }
 
+  // Check if WhatsApp Web is active for this account
+  const waServiceUrl = process.env.WA_SERVICE_URL || 'http://localhost:3001';
+  let isWaWeb = false;
+  try {
+    const waStatusRes = await fetch(`${waServiceUrl}/sessions/${accountId}/status`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(2000),
+    });
+    if (waStatusRes.ok) {
+      const { status } = await waStatusRes.json();
+      if (status === 'ready') isWaWeb = true;
+    }
+    if (!isWaWeb) {
+      const globalStatusRes = await fetch(`${waServiceUrl}/status`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(1500),
+      });
+      if (globalStatusRes.ok) {
+        const { status } = await globalStatusRes.json();
+        if (status === 'ready') isWaWeb = true;
+      }
+    }
+  } catch {
+    isWaWeb = false;
+  }
+
   // Config (fail fast + provides the audit trail owner already resolved
   // by the caller). Meta send needs phone_number_id + decrypted token.
-  const { data: config, error: configError } = await db
+  const { data: config } = await db
     .from('whatsapp_config')
     .select('*')
     .eq('account_id', accountId)
-    .single();
-  if (configError || !config) {
+    .maybeSingle();
+
+  if (!isWaWeb && (!config || !config.phone_number_id || !config.access_token)) {
     throw new BroadcastError(
       'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
+      'WhatsApp no está conectado ni configurado. Por favor, conecta tu WhatsApp mediante código QR en Ajustes o configura tus credenciales de Meta Cloud API.',
       400
     );
   }
-  const accessToken = decrypt(config.access_token);
+  const accessToken = config?.access_token ? decrypt(config.access_token) : undefined;
 
   // Template row (once) for header/button components; guard a
   // malformed local row rather than N identical opaque failures.
@@ -134,7 +163,7 @@ export async function createBroadcast(
     .eq('name', templateName)
     .eq('language', templateLanguage)
     .maybeSingle();
-  if (rawTemplateRow && !isMessageTemplate(rawTemplateRow)) {
+  if (rawTemplateRow && !isMessageTemplate(rawTemplateRow) && !isWaWeb) {
     throw new BroadcastError(
       'template_malformed',
       'Template row is malformed locally — run "Sync from Meta" in Settings to repair it before broadcasting.',
@@ -238,11 +267,13 @@ export async function createBroadcast(
     broadcastId: broadcast.id,
     templateName,
     templateLanguage,
-    phoneNumberId: config.phone_number_id,
+    phoneNumberId: config?.phone_number_id,
     accessToken,
     templateRow,
     planned,
     rejected,
+    accountId,
+    isWaWeb,
   };
 }
 
@@ -265,30 +296,106 @@ export async function deliverBroadcast(
 ): Promise<void> {
   let sentCount = 0;
 
-  for (const recipient of plan.planned) {
+  for (let i = 0; i < plan.planned.length; i++) {
+    const recipient = plan.planned[i];
     const variants = phoneVariants(recipient.phone);
     let sentMessageId: string | null = null;
     let lastError: string | null = null;
 
-    for (const variant of variants) {
+    if (plan.isWaWeb) {
+      // ── Enviar mediante WhatsApp Web Service ──
+      const waServiceUrl = process.env.WA_SERVICE_URL || 'http://localhost:3001';
       try {
-        const result = await sendTemplateMessage({
-          phoneNumberId: plan.phoneNumberId,
-          accessToken: plan.accessToken,
-          to: variant,
-          templateName: plan.templateName,
-          language: plan.templateLanguage,
-          template: plan.templateRow ?? undefined,
-          params: recipient.params,
+        let body = plan.templateRow?.body_text || `[${plan.templateName}]`;
+        (recipient.params || []).forEach((val, idx) => {
+          body = body.replace(new RegExp(`\\{\\{${idx + 1}\\}\\}`, 'g'), val || '');
         });
-        sentMessageId = result.messageId;
-        lastError = null;
-        break;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Unknown error';
-        lastError = message;
-        // Only a "recipient not allowed" error is worth another variant.
-        if (!isRecipientNotAllowedError(message)) break;
+
+        const parts: string[] = [];
+        if (plan.templateRow?.header_type === 'text' && plan.templateRow?.header_content) {
+          parts.push(`*${plan.templateRow.header_content}*`);
+        }
+        if (body) parts.push(body);
+        if (plan.templateRow?.footer_text) parts.push(`_${plan.templateRow.footer_text}_`);
+        if (plan.templateRow?.buttons && plan.templateRow.buttons.length > 0) {
+          const btnTexts = plan.templateRow.buttons
+            .map((b) => {
+              if (b.type === 'URL' && b.url) return `👉 ${b.text}: ${b.url}`;
+              if (b.type === 'PHONE_NUMBER' && b.phone_number) return `📞 ${b.text}: ${b.phone_number}`;
+              return `• ${b.text}`;
+            })
+            .join('\n');
+          parts.push(btnTexts);
+        }
+
+        const textMessage = parts.join('\n\n');
+        const mediaUrl = plan.templateRow?.header_type !== 'text' ? plan.templateRow?.header_media_url : undefined;
+
+        const sendRes = await fetch(`${waServiceUrl}/sessions/${plan.accountId}/send`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            to: recipient.phone,
+            message: textMessage,
+            mediaUrl: mediaUrl || undefined,
+            fromCrm: true,
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+
+        if (sendRes.ok) {
+          const data = await sendRes.json();
+          sentMessageId = data.messageId || `wa-web-${Date.now()}`;
+        } else {
+          const globalRes = await fetch(`${waServiceUrl}/send`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              to: recipient.phone,
+              message: textMessage,
+              mediaUrl: mediaUrl || undefined,
+              fromCrm: true,
+            }),
+            signal: AbortSignal.timeout(15000),
+          });
+          if (globalRes.ok) {
+            const data = await globalRes.json();
+            sentMessageId = data.messageId || `wa-web-${Date.now()}`;
+          } else {
+            const errData = await sendRes.json().catch(() => ({}));
+            lastError = errData.error || 'Error enviando por WhatsApp Web';
+          }
+        }
+      } catch (err: any) {
+        lastError = err.message || 'Error de conexión con WhatsApp Web';
+      }
+
+      // Delay anti-ban para WhatsApp Web (1.5s - 2.5s)
+      if (i < plan.planned.length - 1) {
+        await new Promise((r) => setTimeout(r, Math.floor(1500 + Math.random() * 1000)));
+      }
+    } else {
+      // ── Enviar mediante Meta Cloud API ──
+      for (const variant of variants) {
+        try {
+          const result = await sendTemplateMessage({
+            phoneNumberId: plan.phoneNumberId!,
+            accessToken: plan.accessToken!,
+            to: variant,
+            templateName: plan.templateName,
+            language: plan.templateLanguage,
+            template: plan.templateRow ?? undefined,
+            params: recipient.params,
+          });
+          sentMessageId = result.messageId;
+          lastError = null;
+          break;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unknown error';
+          lastError = message;
+          // Only a "recipient not allowed" error is worth another variant.
+          if (!isRecipientNotAllowedError(message)) break;
+        }
       }
     }
 

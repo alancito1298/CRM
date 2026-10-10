@@ -20,6 +20,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useAuth } from '@/hooks/use-auth';
+import { AiOnboardingModal } from './ai-onboarding-modal';
 
 export function OnboardingWizard() {
   const router = useRouter();
@@ -28,6 +29,7 @@ export function OnboardingWizard() {
   const [step, setStep] = useState(1);
   const [businessName, setBusinessName] = useState('');
   const [savingName, setSavingName] = useState(false);
+  const [questionnaireOpen, setQuestionnaireOpen] = useState(false);
 
   useEffect(() => {
     if (!accountId) return;
@@ -89,7 +91,8 @@ export function OnboardingWizard() {
   if (!open) return null;
 
   return (
-    <Dialog open={open} onOpenChange={(val) => !val && handleFinish()}>
+    <>
+      <Dialog open={open} onOpenChange={(val) => !val && handleFinish()}>
       <DialogContent className="sm:max-w-lg p-0 overflow-hidden border-border/80 bg-card">
         {/* Banner superior con gradiente */}
         <div className="bg-gradient-to-r from-primary via-indigo-600 to-emerald-500 p-6 text-white relative">
@@ -190,12 +193,21 @@ export function OnboardingWizard() {
                 <div className="text-xs space-y-1">
                   <h4 className="font-semibold text-foreground">Atención Automatizada con IA</h4>
                   <p className="text-muted-foreground">
-                    Tu CRM incluye un motor inteligente de respuestas con Groq, Gemini y OpenAI que detecta saludos, preguntas de precios y ofrece soporte instantáneo a tus prospectos.
+                    Tu CRM incluye un motor inteligente de respuestas con Groq, Gemini y OpenAI que conoce tu negocio, resuelve dudas de clientes y califica prospectos.
                   </p>
                 </div>
               </div>
 
-              <div className="text-center py-2">
+              <div className="flex flex-col sm:flex-row gap-2 justify-center py-2">
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={() => setQuestionnaireOpen(true)}
+                  className="gap-2 text-xs bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm"
+                >
+                  <Sparkles className="size-4" />
+                  Completar Cuestionario de Negocio (Recomendado)
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"
@@ -206,7 +218,7 @@ export function OnboardingWizard() {
                   className="gap-2 text-xs border-indigo-500/40 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-500/10"
                 >
                   <Bot className="size-4" />
-                  Explorar Agente de IA
+                  Configuración Avanzada
                 </Button>
               </div>
             </div>
@@ -284,5 +296,15 @@ export function OnboardingWizard() {
         </div>
       </DialogContent>
     </Dialog>
+
+    {/* Modal interactivo del Cuestionario de Onboarding para entrenar la IA */}
+    <AiOnboardingModal
+      open={questionnaireOpen}
+      onOpenChange={setQuestionnaireOpen}
+      onSuccess={() => {
+        setStep(4);
+      }}
+    />
+    </>
   );
 }
