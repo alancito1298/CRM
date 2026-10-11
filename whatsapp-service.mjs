@@ -65,7 +65,39 @@ function createSessionState(accountId) {
     lastRestartAt: 0,
     recentSentIds: new Set(),
     recentProcessedIds: new Set(),
+    pendingOutgoingText: new Map(), // key -> timestamp
   };
+}
+
+function markOutgoingPending(session, phone, text) {
+  if (!session || !phone || !text) return '';
+  const clean = normalizePhone(phone);
+  const trimmed = text.trim();
+  const key = `${clean}:${trimmed}`;
+  session.pendingOutgoingText.set(key, Date.now());
+  setTimeout(() => {
+    session.pendingOutgoingText.delete(key);
+  }, 45000);
+  return key;
+}
+
+function isOutgoingPending(session, phone, text) {
+  if (!session || !phone || !text) return false;
+  const clean = normalizePhone(phone);
+  const trimmed = text.trim();
+  if (session.pendingOutgoingText.has(`${clean}:${trimmed}`)) return true;
+  for (const v of getPhoneVariants(clean)) {
+    if (session.pendingOutgoingText.has(`${normalizePhone(v)}:${trimmed}`)) return true;
+  }
+  return false;
+}
+
+function rememberSentId(session, id) {
+  if (!session || !id) return;
+  session.recentSentIds.add(id);
+  setTimeout(() => {
+    session.recentSentIds.delete(id);
+  }, 120000);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -199,6 +231,18 @@ async function resolveRealPhone(session, waId) {
 async function handleAiAutoReply(session, { conversationId, contactPhone }) {
   const { accountId, client } = session;
   try {
+    // ── FILTRO MODO PRUEBAS: Solo responder al número autorizado ──
+    const ALLOWED_TEST_PHONE = process.env.AI_TEST_PHONE_ONLY || '1168863090';
+    if (ALLOWED_TEST_PHONE) {
+      const cleanContact = normalizePhone(contactPhone);
+      const cleanAllowed = normalizePhone(ALLOWED_TEST_PHONE);
+      const isAllowed = cleanContact.endsWith(cleanAllowed) || cleanAllowed.endsWith(cleanContact);
+      if (!isAllowed) {
+        log(accountId, `🔒 [Modo Pruebas] Auto-reply omitido para +${cleanContact}. Solo autorizado para: ${ALLOWED_TEST_PHONE}`);
+        return;
+      }
+    }
+
     const { data: config } = await supabase
       .from('ai_configs')
       .select('*')
@@ -276,9 +320,14 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
         const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-          body: JSON.stringify({ model: modelName, messages, max_tokens: 250, temperature: 0.6 }),
+          body: JSON.stringify({ model: modelName, messages, max_tokens: 350, temperature: 0.7 }),
         });
-        if (resp.ok) replyText = (await resp.json()).choices?.[0]?.message?.content?.trim() || '';
+        if (resp.ok) {
+          replyText = (await resp.json()).choices?.[0]?.message?.content?.trim() || '';
+        } else {
+          const errData = await resp.json().catch(() => ({}));
+          console.error(`[WA][${accountId.slice(0, 8)}] Error Groq ${resp.status}:`, JSON.stringify(errData));
+        }
       } else if (config.provider === 'openai') {
         const resp = await fetch('https://api.openai.com/v1/chat/completions', {
           method: 'POST',
@@ -308,8 +357,11 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
     }
 
     if (!replyText) {
-      replyText = 'Para brindarte una información más acertada, una persona especializada se pondrá en contacto contigo por este mismo chat a la brevedad. 😊';
+      replyText = 'Hola, todo bien? Qué andabas buscando hacer?';
     }
+
+    // Quitar signos de apertura (¿ y ¡) para garantizar el estilo natural y relajado de chat
+    replyText = replyText.replace(/¿/g, '').replace(/¡/g, '').trim();
 
     log(accountId, `💬 "${replyText.slice(0, 60)}..."`);
 
@@ -320,25 +372,91 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
       if (numberId?._serialized) chatId = numberId._serialized;
     } catch {}
 
+    // Registrar texto antes del envío para que message_create no lo capture como agente
+    markOutgoingPending(session, digits, replyText);
+    markOutgoingPending(session, chatId, replyText);
+
     const msgResult = await client.sendMessage(chatId, replyText);
-    if (msgResult?.id?.id) session.recentSentIds.add(msgResult.id.id);
-    if (msgResult?.id?._serialized) session.recentSentIds.add(msgResult.id._serialized);
+    const resultMsgId = msgResult?.id?.id || msgResult?.id?._serialized || null;
+    if (resultMsgId) {
+      rememberSentId(session, resultMsgId);
+      if (msgResult?.id?.id) rememberSentId(session, msgResult.id.id);
+      if (msgResult?.id?._serialized) rememberSentId(session, msgResult.id._serialized);
+    }
 
-    await supabase.from('messages').insert({
-      conversation_id: conversationId,
-      sender_type: 'bot',
-      content_type: 'text',
-      content_text: replyText,
-      status: 'sent',
-      ai_generated: true,
-    });
+    // Deduplicación en Supabase: si message_create se coló en los últimos 15s, actualizar a bot
+    const fifteenSecAgo = new Date(Date.now() - 15000).toISOString();
+    const { data: existingRecent } = await supabase
+      .from('messages')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .eq('content_text', replyText)
+      .gte('created_at', fifteenSecAgo)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    await supabase.from('conversations').update({
+    if (existingRecent) {
+      await supabase.from('messages').update({
+        sender_type: 'bot',
+        ai_generated: true,
+        message_id: resultMsgId || undefined,
+        status: 'sent',
+      }).eq('id', existingRecent.id);
+    } else {
+      await supabase.from('messages').insert({
+        conversation_id: conversationId,
+        sender_type: 'bot',
+        content_type: 'text',
+        content_text: replyText,
+        status: 'sent',
+        message_id: resultMsgId,
+        ai_generated: true,
+      });
+    }
+
+    const lastCustomerMsg = messages.filter(m => m.role === 'user').pop()?.content || '';
+    const lastCustomerLower = lastCustomerMsg.toLowerCase();
+    const explicitHandoffTriggers = [
+      'quiero hablar con un humano',
+      'pasame con una persona',
+      'hablar con un asesor',
+      'comunicarme con un humano',
+      'atencion humana'
+    ];
+    const customerAskedForHuman = explicitHandoffTriggers.some(kw => lastCustomerLower.includes(kw));
+
+    const replyLower = replyText.toLowerCase();
+    const replyIndicatesHandoff = replyLower.includes('cotización final') || 
+                                  replyLower.includes('presupuesto exacto') || 
+                                  replyLower.includes('le paso todo al equipo del taller') ||
+                                  replyLower.includes('le paso los datos a alan') ||
+                                  replyLower.includes('le paso las cantidades a alan') ||
+                                  replyLower.includes('paso a alan') ||
+                                  replyLower.includes('alan para calcularte') ||
+                                  replyLower.includes('alan te escribe');
+
+    const isHandoff = customerAskedForHuman || replyIndicatesHandoff;
+    const handoffSummary = isHandoff
+      ? (customerAskedForHuman
+          ? `🤖 Cliente solicitó asesor humano: "${lastCustomerMsg.slice(0, 100)}"`
+          : `🤖 Derivación de cotización lista: "${replyText.slice(0, 120)}"`)
+      : null;
+
+    const convUpdate = {
       last_message_text: replyText,
       last_message_at: new Date().toISOString(),
       ai_reply_count: (conv.ai_reply_count || 0) + 1,
       updated_at: new Date().toISOString(),
-    }).eq('id', conversationId);
+    };
+
+    if (isHandoff) {
+      convUpdate.ai_autoreply_disabled = true;
+      convUpdate.ai_handoff_summary = handoffSummary;
+      log(accountId, `🚨 Derivación a humano (Handoff) activada para chat con +${digits}`);
+    }
+
+    await supabase.from('conversations').update(convUpdate).eq('id', conversationId);
 
     // Incrementar contador de mensajes usados en el mes para el SaaS
     if (sub?.id) {
@@ -555,6 +673,24 @@ async function saveMessage(session, { phone, name, body, mediaUrl, contentType =
     if (messageId) {
       const { data: existingMsg } = await supabase.from('messages').select('id').eq('message_id', finalMsgId).maybeSingle();
       if (existingMsg) return { contact, conversation, alreadyExists: true };
+    }
+
+    // Deduplicación por contenido y conversación reciente (últimos 10 segundos)
+    if (contentText && !isHistoric) {
+      const tenSecAgo = new Date(Date.now() - 10000).toISOString();
+      const { data: duplicateRecent } = await supabase
+        .from('messages')
+        .select('id')
+        .eq('conversation_id', conversation.id)
+        .eq('content_text', contentText)
+        .gte('created_at', tenSecAgo)
+        .limit(1)
+        .maybeSingle();
+
+      if (duplicateRecent) {
+        log(accountId, `⚠️ Mensaje duplicado omitido en conv ${conversation.id}`);
+        return { contact, conversation, alreadyExists: true };
+      }
     }
 
     const { error: msgErr } = await supabase.from('messages').insert({
@@ -1247,7 +1383,16 @@ function initSession(accountId, { pairingPhone } = {}) {
   client.on('message_create', async (msg) => {
     if (!msg.fromMe || msg.to?.includes('@g.us') || msg.to === 'status@broadcast') return;
     if (msg.timestamp && msg.timestamp < session.readyTimestamp) return;
-    if (session.recentSentIds.has(msg.id.id)) { session.recentSentIds.delete(msg.id.id); return; }
+
+    // Verificar si es un mensaje enviado por la IA o por el CRM
+    const isKnownId = session.recentSentIds.has(msg.id?.id) || session.recentSentIds.has(msg.id?._serialized);
+    const isPendingText = isOutgoingPending(session, msg.to, msg.body || '');
+
+    if (isKnownId || isPendingText) {
+      if (msg.id?.id) rememberSentId(session, msg.id.id);
+      if (msg.id?._serialized) rememberSentId(session, msg.id._serialized);
+      return; // Ya registrado o en proceso, omitir para no duplicar
+    }
 
     const chatId = msg.to;
     const phone = await resolveRealPhone(session, chatId);
@@ -1619,6 +1764,12 @@ const server = http.createServer(async (req, res) => {
           if (!numberId) return json({ error: `El número ${to} no tiene WhatsApp activo` }, 404);
 
           const chatId = numberId._serialized;
+
+          if (message) {
+            markOutgoingPending(session, digits, message);
+            markOutgoingPending(session, chatId, message);
+          }
+
           let msgResult;
           if (mediaUrl) {
             const media = await MessageMedia.fromUrl(mediaUrl);
@@ -1632,7 +1783,8 @@ const server = http.createServer(async (req, res) => {
           }
 
           const messageId = msgResult?.id?.id || `wa-out-${Date.now()}`;
-          if (msgResult?.id?.id) session.recentSentIds.add(msgResult.id.id);
+          if (msgResult?.id?.id) rememberSentId(session, msgResult.id.id);
+          if (msgResult?.id?._serialized) rememberSentId(session, msgResult.id._serialized);
 
           if (!fromCrm) {
             await saveMessage(session, { phone: digits, body: message, mediaUrl, contentType, messageId, senderType: 'agent' });

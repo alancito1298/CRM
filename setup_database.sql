@@ -5379,6 +5379,95 @@ CREATE POLICY ai_onboarding_responses_update ON ai_onboarding_responses FOR UPDA
 
 DROP POLICY IF EXISTS ai_onboarding_responses_delete ON ai_onboarding_responses;
 CREATE POLICY ai_onboarding_responses_delete ON ai_onboarding_responses FOR DELETE
-  USING (is_account_member(account_id, 'admin'));
 -- END 041_ai_onboarding_questionnaire.sql
+
+-- ============================================================
+-- 042_realtime_handoff_notifications.sql
+-- ============================================================
+ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_type_check;
+ALTER TABLE notifications ADD CONSTRAINT notifications_type_check
+  CHECK (type IN ('conversation_assigned', 'ai_handoff', 'new_lead', 'payment_received'));
+
+CREATE OR REPLACE FUNCTION notify_conversation_ai_handoff()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_contact_name TEXT;
+  v_member RECORD;
+BEGIN
+  IF NEW.ai_handoff_summary IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'UPDATE' AND OLD.ai_handoff_summary IS NOT NULL AND OLD.ai_handoff_summary = NEW.ai_handoff_summary THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT COALESCE(NULLIF(name, ''), phone, 'un cliente') INTO v_contact_name
+  FROM contacts WHERE id = NEW.contact_id;
+
+  IF NEW.assigned_agent_id IS NOT NULL THEN
+    INSERT INTO notifications (
+      account_id,
+      user_id,
+      type,
+      conversation_id,
+      contact_id,
+      actor_user_id,
+      title,
+      body
+    ) VALUES (
+      NEW.account_id,
+      NEW.assigned_agent_id,
+      'ai_handoff',
+      NEW.id,
+      NEW.contact_id,
+      NULL,
+      '🚨 Derivación de IA: ' || COALESCE(v_contact_name, 'Contacto'),
+      COALESCE(NEW.ai_handoff_summary, 'El cliente requiere atención de un asesor humano.')
+    );
+  ELSE
+    FOR v_member IN
+      SELECT user_id FROM account_members
+      WHERE account_id = NEW.account_id
+    LOOP
+      INSERT INTO notifications (
+        account_id,
+        user_id,
+        type,
+        conversation_id,
+        contact_id,
+        actor_user_id,
+        title,
+        body
+      ) VALUES (
+        NEW.account_id,
+        v_member.user_id,
+        'ai_handoff',
+        NEW.id,
+        NEW.contact_id,
+        NULL,
+        '🚨 Derivación de IA: ' || COALESCE(v_contact_name, 'Contacto'),
+        COALESCE(NEW.ai_handoff_summary, 'El cliente requiere atención de un asesor humano.')
+      );
+    END LOOP;
+  END IF;
+
+  RETURN NEW;
+EXCEPTION WHEN OTHERS THEN
+  RAISE WARNING 'Failed to create AI handoff notification for conversation %: %', NEW.id, SQLERRM;
+  RETURN NEW;
+END;
+$$;
+
+ALTER FUNCTION notify_conversation_ai_handoff() OWNER TO postgres;
+
+DROP TRIGGER IF EXISTS on_conversation_ai_handoff ON conversations;
+CREATE TRIGGER on_conversation_ai_handoff
+  AFTER INSERT OR UPDATE OF ai_handoff_summary ON conversations
+  FOR EACH ROW EXECUTE FUNCTION notify_conversation_ai_handoff();
+-- END 042_realtime_handoff_notifications.sql
 
