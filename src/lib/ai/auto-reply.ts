@@ -74,13 +74,7 @@ export async function dispatchInboundToAiReply(
       .maybeSingle()
     if (convErr || !conv) return
     if (conv.assigned_agent_id) return // a human owns this thread
-    if (conv.ai_autoreply_disabled) {
-      // Auto-heal: if no human agent is assigned, clear stale handoff/pause so the bot answers
-      await db
-        .from('conversations')
-        .update({ ai_autoreply_disabled: false, ai_handoff_summary: null })
-        .eq('id', conversationId)
-    }
+    if (conv.ai_autoreply_disabled) return
     const maxReplies = Math.max(config.autoReplyMaxPerConversation || 10, 500)
     if (conv.ai_reply_count >= maxReplies) return
 

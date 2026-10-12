@@ -40,7 +40,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !ENCRYPTION_KEY) {
   process.exit(1);
 }
 
-globalThis.WebSocket = class {};
+globalThis.WebSocket = class { };
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // ─── Session Manager ──────────────────────────────────────────────────────────
@@ -180,7 +180,7 @@ async function resolveRealPhone(session, waId) {
         }
       }
     }
-  } catch {}
+  } catch { }
 
   try {
     if (client?.pupPage) {
@@ -222,7 +222,7 @@ async function resolveRealPhone(session, waId) {
         }
       }
     }
-  } catch {}
+  } catch { }
 
   return clean;
 }
@@ -231,12 +231,22 @@ async function resolveRealPhone(session, waId) {
 async function handleAiAutoReply(session, { conversationId, contactPhone }) {
   const { accountId, client } = session;
   try {
-    // ── FILTRO MODO PRUEBAS: Solo responder al número autorizado ──
-    const ALLOWED_TEST_PHONE = process.env.AI_TEST_PHONE_ONLY || '1168863090';
+    // ── FILTRO MODO PRUEBAS: Solo responder a números autorizados ──
+    const ALLOWED_TEST_PHONE = process.env.AI_TEST_PHONE_ONLY || '1168863090,3445416457';
     if (ALLOWED_TEST_PHONE) {
       const cleanContact = normalizePhone(contactPhone);
-      const cleanAllowed = normalizePhone(ALLOWED_TEST_PHONE);
-      const isAllowed = cleanContact.endsWith(cleanAllowed) || cleanAllowed.endsWith(cleanContact);
+      const allowedList = ALLOWED_TEST_PHONE.split(',').map(p => normalizePhone(p)).filter(Boolean);
+      const isAllowed = allowedList.some(allowed => {
+        if (!allowed) return false;
+        if (cleanContact === allowed) return true;
+        if (cleanContact.endsWith(allowed) || allowed.endsWith(cleanContact)) return true;
+        const localAllowed = allowed.replace(/^549?/, '');
+        const localContact = cleanContact.replace(/^549?/, '');
+        if (localAllowed && localContact && (localContact === localAllowed || localContact.endsWith(localAllowed) || localAllowed.endsWith(localContact))) {
+          return true;
+        }
+        return false;
+      });
       if (!isAllowed) {
         log(accountId, `🔒 [Modo Pruebas] Auto-reply omitido para +${cleanContact}. Solo autorizado para: ${ALLOWED_TEST_PHONE}`);
         return;
@@ -279,9 +289,8 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
     if (!conv || conv.assigned_agent_id) return;
 
     if (conv.ai_autoreply_disabled) {
-      await supabase.from('conversations')
-        .update({ ai_autoreply_disabled: false, ai_handoff_summary: null })
-        .eq('id', conversationId);
+      log(accountId, `⏸️ Auto-reply cortado para conv ${conversationId} (intervención manual del usuario).`);
+      return;
     }
 
     const { data: rawMsgs } = await supabase
@@ -292,6 +301,16 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
       .limit(12);
 
     const recentMsgs = rawMsgs ? rawMsgs.reverse() : [];
+
+    // Si el último mensaje saliente fue enviado por el usuario (agente humano), cortar el bot
+    const lastOutgoing = [...recentMsgs].reverse().find(m => m.sender_type === 'agent' || m.sender_type === 'bot');
+    if (lastOutgoing && lastOutgoing.sender_type === 'agent') {
+      log(accountId, `🛑 Último mensaje enviado por el usuario. Pausando bot para conv ${conversationId}`);
+      await supabase.from('conversations')
+        .update({ ai_autoreply_disabled: true, ai_handoff_summary: 'Intervención manual del usuario' })
+        .eq('id', conversationId);
+      return;
+    }
     const messages = [];
     if (config.system_prompt) messages.push({ role: 'system', content: config.system_prompt });
 
@@ -360,6 +379,38 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
       replyText = 'Hola, todo bien? Qué andabas buscando hacer?';
     }
 
+    // ── Detección de Cierre / Handoff via Prompt ──
+    let closureSummary = null;
+    const closureMatch = replyText.match(/\[(?:NOTIFICAR_CIERRE|CERRAR_Y_NOTIFICAR|CIERRE_TRABAJO):\s*([\s\S]*?)\]/i);
+    if (closureMatch) {
+      closureSummary = closureMatch[1].trim();
+      // Remover la etiqueta para que el cliente NUNCA la vea en su WhatsApp
+      replyText = replyText.replace(closureMatch[0], '').trim();
+    }
+
+    if (!replyText) {
+      replyText = 'Dale, ya me anoto todo y quedamos en contacto!';
+    }
+
+    // Detectar número destino configurado en el system_prompt
+    let adminNotifyPhone = null;
+    if (config?.system_prompt) {
+      const notifyMatch = config.system_prompt.match(/NOTIFICAR_A:\s*([+\d\s\-]+)/i);
+      if (notifyMatch) {
+        adminNotifyPhone = normalizePhone(notifyMatch[1]);
+      }
+    }
+
+    // Soporte opcional para número inline: [NOTIFICAR_CIERRE: 1168863090 | resumen...]
+    if (closureSummary && closureSummary.includes('|')) {
+      const parts = closureSummary.split('|');
+      const possiblePhone = normalizePhone(parts[0]);
+      if (possiblePhone.length >= 8 && possiblePhone.length <= 15) {
+        adminNotifyPhone = possiblePhone;
+        closureSummary = parts.slice(1).join('|').trim();
+      }
+    }
+
     // Quitar signos de apertura (¿ y ¡) para garantizar el estilo natural y relajado de chat
     replyText = replyText.replace(/¿/g, '').replace(/¡/g, '').trim();
 
@@ -370,7 +421,7 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
     try {
       const numberId = await client.getNumberId(digits);
       if (numberId?._serialized) chatId = numberId._serialized;
-    } catch {}
+    } catch { }
 
     // Registrar texto antes del envío para que message_create no lo capture como agente
     markOutgoingPending(session, digits, replyText);
@@ -427,20 +478,22 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
     const customerAskedForHuman = explicitHandoffTriggers.some(kw => lastCustomerLower.includes(kw));
 
     const replyLower = replyText.toLowerCase();
-    const replyIndicatesHandoff = replyLower.includes('cotización final') || 
-                                  replyLower.includes('presupuesto exacto') || 
-                                  replyLower.includes('le paso todo al equipo del taller') ||
-                                  replyLower.includes('le paso los datos a alan') ||
-                                  replyLower.includes('le paso las cantidades a alan') ||
-                                  replyLower.includes('paso a alan') ||
-                                  replyLower.includes('alan para calcularte') ||
-                                  replyLower.includes('alan te escribe');
+    const replyIndicatesHandoff = replyLower.includes('cotización final') ||
+      replyLower.includes('presupuesto exacto') ||
+      replyLower.includes('le paso todo al equipo del taller') ||
+      replyLower.includes('le paso los datos a alan') ||
+      replyLower.includes('le paso las cantidades a alan') ||
+      replyLower.includes('paso a alan') ||
+      replyLower.includes('alan para calcularte') ||
+      replyLower.includes('alan te escribe');
 
-    const isHandoff = customerAskedForHuman || replyIndicatesHandoff;
+    const isHandoff = !!closureSummary || customerAskedForHuman || replyIndicatesHandoff;
     const handoffSummary = isHandoff
-      ? (customerAskedForHuman
+      ? (closureSummary
+        ? `🤖 Trabajo/pedido cerrado: "${closureSummary.slice(0, 150)}"`
+        : (customerAskedForHuman
           ? `🤖 Cliente solicitó asesor humano: "${lastCustomerMsg.slice(0, 100)}"`
-          : `🤖 Derivación de cotización lista: "${replyText.slice(0, 120)}"`)
+          : `🤖 Derivación de cotización lista: "${replyText.slice(0, 120)}"`))
       : null;
 
     const convUpdate = {
@@ -457,6 +510,48 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
     }
 
     await supabase.from('conversations').update(convUpdate).eq('id', conversationId);
+
+    // ── Enviar notificación al chat del dueño si se activó por prompt ──
+    if (closureSummary && adminNotifyPhone) {
+      try {
+        const notifDigits = normalizePhone(adminNotifyPhone);
+        let notifChatId = `${notifDigits}@c.us`;
+        try {
+          const nid = await client.getNumberId(notifDigits);
+          if (nid?._serialized) notifChatId = nid._serialized;
+        } catch { }
+
+        // Consultar nombre del cliente
+        const { data: contactInfo } = await supabase
+          .from('contacts')
+          .select('name, phone')
+          .eq('account_id', accountId)
+          .in('phone', getPhoneVariants(digits))
+          .limit(1)
+          .maybeSingle();
+
+        const clientName = (contactInfo?.name && contactInfo.name !== contactInfo.phone) ? contactInfo.name : `+${digits}`;
+
+        const notificationMessage =
+`🔔 *NUEVO PEDIDO / TRABAJO CERRADO*
+👤 *Cliente:* ${clientName} (+${digits})
+📝 *Resumen del pedido:*
+${closureSummary}
+
+🛑 *Nota:* El bot ya se pausó automáticamente en este chat para que puedas empezar a trabajar o coordinar la entrega.`;
+
+        markOutgoingPending(session, notifDigits, notificationMessage);
+        markOutgoingPending(session, notifChatId, notificationMessage);
+
+        const notifResult = await client.sendMessage(notifChatId, notificationMessage);
+        const notifMsgId = notifResult?.id?.id || notifResult?.id?._serialized || null;
+        if (notifMsgId) rememberSentId(session, notifMsgId);
+
+        log(accountId, `📢 Notificación de cierre enviada a +${notifDigits} por pedido de +${digits}`);
+      } catch (notifErr) {
+        console.error(`[WA][${accountId.slice(0, 8)}] Error enviando notificación a admin:`, notifErr.message);
+      }
+    }
 
     // Incrementar contador de mensajes usados en el mes para el SaaS
     if (sub?.id) {
@@ -716,6 +811,12 @@ async function saveMessage(session, { phone, name, body, mediaUrl, contentType =
     if (!isHistoric && senderType === 'customer') {
       convUpdates.unread_count = (conversation.unread_count || 0) + 1;
     }
+    // Si el usuario (agente) manda un mensaje, cortar inmediatamente el bot
+    if (!isHistoric && senderType === 'agent') {
+      convUpdates.ai_autoreply_disabled = true;
+      convUpdates.ai_handoff_summary = 'Intervención manual del usuario';
+      log(accountId, `🛑 Mensaje de agente detectado. Bot pausado para conv ${conversation.id}`);
+    }
     if (Object.keys(convUpdates).length > 0) {
       await supabase.from('conversations').update(convUpdates).eq('id', conversation.id);
     }
@@ -768,7 +869,7 @@ async function getContactAvatar(session, chatId) {
         const thumbColl = collections?.ProfilePicThumb;
         let thumb = thumbColl?.get ? (thumbColl.get(wid) || thumbColl.get(idStr)) : null;
         if (!thumb && thumbColl?.find) {
-          try { thumb = await thumbColl.find(wid); } catch {}
+          try { thumb = await thumbColl.find(wid); } catch { }
         }
         if (thumb?.eurl) return thumb.eurl;
         if (thumb?.img) {
@@ -809,7 +910,7 @@ async function getContactAvatar(session, chatId) {
                 const c = await toDataUrl(res.img);
                 if (c) return c;
               }
-            } catch {}
+            } catch { }
           }
         }
 
@@ -823,7 +924,7 @@ async function getContactAvatar(session, chatId) {
       session._avatarCache.set(chatId, avatarUrl);
       return avatarUrl;
     }
-  } catch {}
+  } catch { }
   return null;
 }
 
@@ -935,9 +1036,9 @@ async function syncRecentChats(session, maxChats = 50, msgsPerChat = 30) {
                 const res = await bridge.requestProfilePicFromServer(c);
                 if (res?.eurl) avatarUrl = res.eurl;
                 else if (res?.img) avatarUrl = await toDataUrl(res.img);
-              } catch {}
+              } catch { }
             }
-          } catch {}
+          } catch { }
 
           let resolvedPhone = null;
           const isLid = c.id?._serialized?.endsWith('@lid') || c.id?.server === 'lid';
@@ -948,7 +1049,7 @@ async function syncRecentChats(session, maxChats = 50, msgsPerChat = 30) {
               if (pnWid?.user) resolvedPhone = pnWid.user;
               else if (pnWid?._serialized) resolvedPhone = pnWid._serialized.split('@')[0];
               else if (c.contact?.phoneNumber?.user) resolvedPhone = c.contact.phoneNumber.user;
-            } catch {}
+            } catch { }
           } else {
             resolvedPhone = c.id?.user || c.id?._serialized?.split('@')[0];
           }
@@ -1050,7 +1151,7 @@ async function syncRecentChats(session, maxChats = 50, msgsPerChat = 30) {
             type: m.type || 'chat',
             hasMedia: !!m.hasMedia,
           }));
-        } catch {}
+        } catch { }
       }
 
       if (validMessages.length === 0) { totalSkipped++; continue; }
@@ -1130,7 +1231,7 @@ async function checkUnreadChats(session) {
 
       const result = await saveMessage(session, { phone, name: item.name, body: item.body, messageId: item.messageId, avatarUrl });
       if (result) {
-        handleAiAutoReply(session, { conversationId: result.conversation.id, contactPhone: phone }).catch(() => {});
+        handleAiAutoReply(session, { conversationId: result.conversation.id, contactPhone: phone }).catch(() => { });
       }
     }
   } catch (err) {
@@ -1149,13 +1250,13 @@ function startModalDismisser(session) {
           const dialog = document.querySelector('div[role="dialog"]');
           if (!dialog) return;
           const btn = dialog.querySelector('[aria-label="Close"]') ||
-                      dialog.querySelector('[data-icon="x"]')?.closest('button') ||
-                      dialog.querySelector('button[aria-label="Cerrar"]') ||
-                      dialog.querySelector('button');
+            dialog.querySelector('[data-icon="x"]')?.closest('button') ||
+            dialog.querySelector('button[aria-label="Cerrar"]') ||
+            dialog.querySelector('button');
           if (btn) btn.click();
         });
       }
-    } catch {}
+    } catch { }
   }, 3000);
 }
 
@@ -1177,7 +1278,7 @@ function initSession(accountId, { pairingPhone } = {}) {
     }
     // Si estaba en estado previo (error, stopped, o client null tras restart), limpiamos antes de recrear
     if (existing.client) {
-      try { existing.client.destroy().catch(() => {}); } catch {}
+      try { existing.client.destroy().catch(() => { }); } catch { }
       existing.client = null;
     }
   }
@@ -1225,7 +1326,7 @@ function initSession(accountId, { pairingPhone } = {}) {
     }
     session.status = 'qr';
     log(accountId, `QR listo → GET /sessions/${accountId}/qr`);
-    supabase.from('whatsapp_config').update({ status: 'qr', updated_at: new Date().toISOString() }).eq('account_id', accountId).then(() => {});
+    supabase.from('whatsapp_config').update({ status: 'qr', updated_at: new Date().toISOString() }).eq('account_id', accountId).then(() => { });
   });
 
   client.on('code', (code) => {
@@ -1326,7 +1427,7 @@ function initSession(accountId, { pairingPhone } = {}) {
     const chatId = msg.author || msg.from;
     const phone = await resolveRealPhone(session, chatId);
     let name = null;
-    try { const c = await msg.getContact(); name = c?.pushname || c?.name || null; } catch {}
+    try { const c = await msg.getContact(); name = c?.pushname || c?.name || null; } catch { }
     const avatarUrl = await getContactAvatar(session, chatId);
 
     let mediaUrl = null;
@@ -1376,7 +1477,7 @@ function initSession(accountId, { pairingPhone } = {}) {
       avatarUrl,
     });
     if (result) {
-      handleAiAutoReply(session, { conversationId: result.conversation.id, contactPhone: phone }).catch(() => {});
+      handleAiAutoReply(session, { conversationId: result.conversation.id, contactPhone: phone }).catch(() => { });
     }
   });
 
@@ -1397,7 +1498,7 @@ function initSession(accountId, { pairingPhone } = {}) {
     const chatId = msg.to;
     const phone = await resolveRealPhone(session, chatId);
     let name = null;
-    try { const c = await msg.getContact(); name = c?.pushname || c?.name || null; } catch {}
+    try { const c = await msg.getContact(); name = c?.pushname || c?.name || null; } catch { }
     const avatarUrl = await getContactAvatar(session, chatId);
 
     let mediaUrl = null;
@@ -1431,7 +1532,7 @@ function initSession(accountId, { pairingPhone } = {}) {
       }
     }
 
-    await saveMessage(session, {
+    const result = await saveMessage(session, {
       phone,
       name,
       body,
@@ -1441,11 +1542,18 @@ function initSession(accountId, { pairingPhone } = {}) {
       senderType: 'agent',
       avatarUrl,
     });
+
+    if (result?.conversation) {
+      await supabase.from('conversations').update({
+        ai_autoreply_disabled: true,
+        ai_handoff_summary: 'Intervención manual del usuario',
+      }).eq('id', result.conversation.id);
+    }
   });
 
   client.on('disconnected', (reason) => {
     log(accountId, `⚠️ Desconectado: ${reason}`);
-    supabase.from('whatsapp_config').update({ status: 'disconnected', updated_at: new Date().toISOString() }).eq('account_id', accountId).then(() => {});
+    supabase.from('whatsapp_config').update({ status: 'disconnected', updated_at: new Date().toISOString() }).eq('account_id', accountId).then(() => { });
     restartSession(session, reason);
   });
 
@@ -1475,7 +1583,7 @@ async function restartSession(session, reason) {
   const delay = session.restartAttempts > 3 ? 30_000 : 5_000;
   log(accId, `🔄 Reiniciando (${reason}) en ${delay / 1000}s (intento ${session.restartAttempts})...`);
 
-  try { if (session.client) await session.client.destroy().catch(() => {}); } catch {}
+  try { if (session.client) await session.client.destroy().catch(() => { }); } catch { }
   session.client = null;
   sessions.delete(accId);
   setTimeout(() => {
@@ -1486,7 +1594,7 @@ async function restartSession(session, reason) {
 async function stopSession(accountId) {
   const session = sessions.get(accountId);
   if (!session) return false;
-  try { if (session.client) await session.client.destroy().catch(() => {}); } catch {}
+  try { if (session.client) await session.client.destroy().catch(() => { }); } catch { }
   session.status = 'stopped';
   session.client = null;
   sessions.delete(accountId);
@@ -1608,9 +1716,9 @@ const server = http.createServer(async (req, res) => {
   <div style="font-size:44px;margin-bottom:12px">💬</div>
   <h1>Conectar WhatsApp</h1>
   ${isReady
-    ? `<div class="ready">✅ Conectado<br><span style="font-size:13px;font-weight:400;color:#86efac;margin-top:6px;display:block">${session.phone || ''}</span></div>`
-    : hasPairing
-      ? `<p>Ingresá este código en tu WhatsApp:</p>
+          ? `<div class="ready">✅ Conectado<br><span style="font-size:13px;font-weight:400;color:#86efac;margin-top:6px;display:block">${session.phone || ''}</span></div>`
+          : hasPairing
+            ? `<p>Ingresá este código en tu WhatsApp:</p>
          <div style="font-size:36px;letter-spacing:6px;font-weight:800;color:#25d366;background:rgba(37,211,102,.12);padding:18px 24px;border-radius:16px;border:2px dashed #25d366;font-family:monospace;margin-bottom:24px;display:inline-block">${session.pairingCode}</div>
          <div class="steps">
            <div class="step"><span class="n">1</span>Abrí WhatsApp en tu celular</div>
@@ -1619,8 +1727,8 @@ const server = http.createServer(async (req, res) => {
            <div class="step"><span class="n">4</span>Tocá "Vincular con el número de teléfono"</div>
            <div class="step"><span class="n">5</span>Escribí el código de 8 caracteres</div>
          </div>`
-      : hasQr
-        ? `<p>Escaneá con tu celular para conectar esta cuenta</p>
+            : hasQr
+              ? `<p>Escaneá con tu celular para conectar esta cuenta</p>
            <div class="qr"><img src="${qrImg}" width="248" height="248"/></div>
            <div class="steps">
              <div class="step"><span class="n">1</span>Abrí WhatsApp en tu celular</div>
@@ -1628,8 +1736,8 @@ const server = http.createServer(async (req, res) => {
              <div class="step"><span class="n">3</span>Tocá "Vincular dispositivo"</div>
              <div class="step"><span class="n">4</span>Apuntá la cámara al QR</div>
            </div>`
-        : `<div class="waiting"><div class="spinner"></div>Iniciando... (${session?.status || 'no iniciado'})</div>`
-  }
+              : `<div class="waiting"><div class="spinner"></div>Iniciando... (${session?.status || 'no iniciado'})</div>`
+        }
 </div></body></html>`);
     }
 
@@ -1686,7 +1794,7 @@ const server = http.createServer(async (req, res) => {
         s.pairingCode = null;
         s.requestedPairingPhone = null;
         if (s.client && typeof s.client.cancelPairingCode === 'function') {
-          try { await s.client.cancelPairingCode(); } catch {}
+          try { await s.client.cancelPairingCode(); } catch { }
         }
         s.status = s.qr ? 'qr' : 'initializing';
       }
@@ -1737,7 +1845,7 @@ const server = http.createServer(async (req, res) => {
       const isConn = session?.status === 'ready' || session?.status === 'authenticated';
       if (!isConn) return json({ error: 'WhatsApp no conectado', accountId, status: session?.status || 'not_started' }, 503);
 
-      backfillContactAvatars(session).catch(() => {});
+      backfillContactAvatars(session).catch(() => { });
       return json({ accountId, status: 'syncing_avatars', message: 'Sincronización de fotos de perfil iniciada en segundo plano' });
     }
 
@@ -1787,7 +1895,13 @@ const server = http.createServer(async (req, res) => {
           if (msgResult?.id?._serialized) rememberSentId(session, msgResult.id._serialized);
 
           if (!fromCrm) {
-            await saveMessage(session, { phone: digits, body: message, mediaUrl, contentType, messageId, senderType: 'agent' });
+            const saved = await saveMessage(session, { phone: digits, body: message, mediaUrl, contentType, messageId, senderType: 'agent' });
+            if (saved?.conversation) {
+              await supabase.from('conversations').update({
+                ai_autoreply_disabled: true,
+                ai_handoff_summary: 'Intervención manual del usuario',
+              }).eq('id', saved.conversation.id);
+            }
           }
 
           json({ success: true, messageId });
@@ -1854,8 +1968,8 @@ const gracefulExit = async () => {
   console.log('\n[WA-Service] 🛑 Deteniendo servicio y cerrando navegadores Puppeteer...');
   for (const [id, s] of sessions.entries()) {
     try {
-      if (s.client) await s.client.destroy().catch(() => {});
-    } catch {}
+      if (s.client) await s.client.destroy().catch(() => { });
+    } catch { }
   }
   process.exit(0);
 };
