@@ -27,6 +27,9 @@ import {
   Smartphone,
 } from 'lucide-react';
 import { toast } from 'sonner';
+import { GoogleSignInButton } from '@/components/auth/google-sign-in-button';
+
+const DEMO_ENABLED = process.env.NEXT_PUBLIC_ENABLE_DEMO_SIGNUP === 'true';
 
 export default function SignupPage() {
   return (
@@ -50,6 +53,7 @@ function SignupPageInner() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [demoLoading, setDemoLoading] = useState(false);
+  const [confirmationSentTo, setConfirmationSentTo] = useState<string | null>(null);
 
   const supabase = createClient();
 
@@ -75,40 +79,37 @@ function SignupPageInner() {
     setLoading(true);
 
     try {
-      const res = await fetch('/api/auth/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fullName,
-          companyName,
-          email,
-          password,
-          planSlug,
-        }),
-      });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.error || 'Error al crear la cuenta');
-      }
-
-      toast.success('¡Cuenta creada con éxito! Iniciando sesión...');
-
-      const { error: loginError } = await supabase.auth.signInWithPassword({
-        email,
+      // Supabase sends the confirmation email; the account is only
+      // usable once the link is clicked. Provisioning (account, owner
+      // profile, Free plan) happens in the handle_new_user trigger.
+      // Paid plans are activated by payment, never by this form, so
+      // the choice is only recorded as `requested_plan`.
+      const next = inviteToken ? `/join/${encodeURIComponent(inviteToken)}` : '/dashboard';
+      const { data, error: signUpError } = await supabase.auth.signUp({
+        email: email.trim().toLowerCase(),
         password,
+        options: {
+          emailRedirectTo: `${window.location.origin}/auth/callback?next=${encodeURIComponent(next)}`,
+          data: {
+            full_name: fullName.trim(),
+            company_name: companyName.trim(),
+            requested_plan: planSlug,
+          },
+        },
       });
 
-      if (loginError) {
-        toast.info('Cuenta lista. Por favor ingresa tus credenciales para acceder.');
-        router.push('/login');
+      if (signUpError) throw signUpError;
+
+      // An already-registered email comes back as a user with no
+      // identities (Supabase hides whether the address exists).
+      if (data.user && data.user.identities?.length === 0) {
+        setError('Ese correo ya tiene una cuenta. Iniciá sesión o recuperá tu contraseña.');
         return;
       }
 
-      router.push('/dashboard');
-    } catch (err: any) {
-      setError(err.message || 'Error inesperado al registrarte');
+      setConfirmationSentTo(email.trim().toLowerCase());
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Error inesperado al registrarte');
     } finally {
       setLoading(false);
     }
@@ -117,38 +118,21 @@ function SignupPageInner() {
   const handleQuickDemo = async () => {
     setDemoLoading(true);
     setError(null);
-    const randomNum = Math.floor(1000 + Math.random() * 9000);
-    const demoEmail = `demo.usuario${randomNum}@wacrm.test`;
-    const demoPassword = 'Password123!';
-    const demoName = `Usuario Demo ${randomNum}`;
-    const demoCompany = `Empresa Demo ${randomNum}`;
-
     try {
-      const res = await fetch('/api/auth/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fullName: demoName,
-          companyName: demoCompany,
-          email: demoEmail,
-          password: demoPassword,
-          planSlug: 'starter',
-        }),
-      });
-
+      const res = await fetch('/api/auth/register', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Error creando usuario de prueba');
 
-      toast.success('¡Usuario demo generado! Accediendo al sistema...');
-
-      await supabase.auth.signInWithPassword({
-        email: demoEmail,
-        password: demoPassword,
+      const { error: loginError } = await supabase.auth.signInWithPassword({
+        email: data.email,
+        password: data.password,
       });
+      if (loginError) throw loginError;
 
+      toast.success('¡Usuario demo generado! Accediendo al sistema...');
       router.push('/dashboard');
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Error creando usuario de prueba');
     } finally {
       setDemoLoading(false);
     }
@@ -291,7 +275,8 @@ function SignupPageInner() {
             </p>
           </div>
 
-          {/* Banner de Acceso Rápido Demo (1 clic) */}
+          {/* Banner de Acceso Rápido Demo (1 clic) — solo con NEXT_PUBLIC_ENABLE_DEMO_SIGNUP=true */}
+          {DEMO_ENABLED && (
           <div className="rounded-xl border border-primary/20 bg-gradient-to-r from-primary/10 via-emerald-500/10 to-indigo-500/10 p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
             <div className="space-y-0.5">
               <p className="text-xs font-bold text-foreground flex items-center gap-1.5">
@@ -314,6 +299,17 @@ function SignupPageInner() {
               Probar Demo
             </Button>
           </div>
+          )}
+
+          {confirmationSentTo && (
+            <div className="p-3 text-xs bg-primary/10 border border-primary/30 text-foreground rounded-xl font-medium animate-in fade-in-50 flex gap-2">
+              <Mail className="size-4 text-primary shrink-0" />
+              <span>
+                Te enviamos un correo a <strong>{confirmationSentTo}</strong>. Abrí el enlace para
+                confirmar tu cuenta y entrar.
+              </span>
+            </div>
+          )}
 
           {/* Alerta de Error si ocurre */}
           {error && (
@@ -410,7 +406,7 @@ function SignupPageInner() {
             <div className="space-y-2 pt-1">
               <div className="flex items-center justify-between">
                 <Label className="text-xs font-semibold text-foreground">Elige tu Plan inicial</Label>
-                <span className="text-[10px] text-muted-foreground">Puedes cambiarlo luego</span>
+                <span className="text-[10px] text-muted-foreground">Empezás gratis; los planes pagos se activan al pagar</span>
               </div>
 
               <div className="grid grid-cols-3 gap-2">
@@ -489,6 +485,20 @@ function SignupPageInner() {
               )}
             </Button>
           </form>
+
+          <div className="flex items-center gap-3 text-xs text-muted-foreground">
+            <span className="h-px flex-1 bg-border" />
+            o
+            <span className="h-px flex-1 bg-border" />
+          </div>
+
+          {/* Con Google se crea la cuenta con plan Gratuito; el nombre de la
+              empresa se puede cambiar después desde Ajustes. */}
+          <GoogleSignInButton
+            label="Registrarme con Google"
+            next={inviteToken ? `/join/${encodeURIComponent(inviteToken)}` : '/dashboard'}
+            onError={setError}
+          />
 
           {/* Enlace para usuarios existentes */}
           <div className="text-center pt-2 border-t border-border/50">

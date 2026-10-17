@@ -16,6 +16,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { MessageSquare, UsersRound } from "lucide-react";
+import { GoogleSignInButton } from "@/components/auth/google-sign-in-button";
 
 // `useSearchParams` opts the component out of static prerendering
 // unless it sits under a Suspense boundary. We split the form into
@@ -40,7 +41,11 @@ function LoginPageInner() {
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  // /auth/callback bounces back here with ?error= when the Google
+  // (OAuth) round-trip or the code exchange fails.
+  const [error, setError] = useState<string | null>(
+    searchParams.get("error") ? t("oauthError") : null
+  );
   const [loading, setLoading] = useState(false);
   const supabase = createClient();
 
@@ -148,6 +153,18 @@ function LoginPageInner() {
               {loading ? t('signingIn') : t('signIn')}
             </Button>
           </form>
+
+          <div className="my-4 flex items-center gap-3 text-xs text-muted-foreground">
+            <span className="h-px flex-1 bg-border" />
+            {t('or')}
+            <span className="h-px flex-1 bg-border" />
+          </div>
+
+          <GoogleSignInButton
+            label={t('continueWithGoogle')}
+            next={inviteToken ? `/join/${encodeURIComponent(inviteToken)}` : "/dashboard"}
+            onError={setError}
+          />
 
           <p className="mt-6 text-center text-sm text-muted-foreground">
             {t('noAccount')}{" "}

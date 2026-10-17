@@ -2,8 +2,7 @@ import { NextResponse } from 'next/server';
 import { getCurrentAccount, toErrorResponse } from '@/lib/auth/account';
 import { createClient } from '@/lib/supabase/server';
 import { getAccountPlanDetails } from '@/lib/saas/plans';
-
-const WA_SERVICE_URL = process.env.WA_SERVICE_URL || 'http://localhost:3001';
+import { getWaWebSessionStatus } from '@/lib/whatsapp/providers';
 
 export async function GET() {
   try {
@@ -14,19 +13,9 @@ export async function GET() {
     const planDetails = await getAccountPlanDetails(supabase, ctx.accountId);
 
     // 2. Consultar estado de WhatsApp de esta cuenta
-    let waStatus = 'disconnected';
-    let waPhone = null;
-    try {
-      const waRes = await fetch(`${WA_SERVICE_URL}/sessions/${ctx.accountId}/status`, {
-        cache: 'no-store',
-        signal: AbortSignal.timeout(1500),
-      });
-      if (waRes.ok) {
-        const waData = await waRes.json();
-        waStatus = waData.status || 'disconnected';
-        waPhone = waData.phone || null;
-      }
-    } catch {}
+    const waData = await getWaWebSessionStatus(ctx.accountId, 1500);
+    const waStatus = waData.status || 'disconnected';
+    const waPhone = waData.phone || null;
 
     // 3. Consultar estado de la IA
     const { data: aiConfig } = await supabase

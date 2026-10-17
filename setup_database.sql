@@ -5379,6 +5379,7 @@ CREATE POLICY ai_onboarding_responses_update ON ai_onboarding_responses FOR UPDA
 
 DROP POLICY IF EXISTS ai_onboarding_responses_delete ON ai_onboarding_responses;
 CREATE POLICY ai_onboarding_responses_delete ON ai_onboarding_responses FOR DELETE
+  USING (is_account_member(account_id, 'admin'));
 -- END 041_ai_onboarding_questionnaire.sql
 
 -- ============================================================
@@ -5431,7 +5432,7 @@ BEGIN
     );
   ELSE
     FOR v_member IN
-      SELECT user_id FROM account_members
+      SELECT user_id FROM profiles
       WHERE account_id = NEW.account_id
     LOOP
       INSERT INTO notifications (

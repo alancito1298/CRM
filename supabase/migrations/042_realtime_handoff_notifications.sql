@@ -61,7 +61,7 @@ BEGIN
   ELSE
     -- Case B: Conversation is unassigned — notify all active agents/admins in the account
     FOR v_member IN
-      SELECT user_id FROM account_members
+      SELECT user_id FROM profiles
       WHERE account_id = NEW.account_id
     LOOP
       INSERT INTO notifications (

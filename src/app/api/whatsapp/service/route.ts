@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { getCurrentAccount, requireRole, toErrorResponse } from '@/lib/auth/account';
 
-const WA_SERVICE_URL = process.env.WA_SERVICE_URL || 'http://localhost:3001';
+import { waServiceFetch } from '@/lib/whatsapp/providers';
 
 export async function GET() {
   try {
@@ -9,9 +9,7 @@ export async function GET() {
     const accountId = ctx.accountId;
 
     try {
-      const res = await fetch(`${WA_SERVICE_URL}/sessions/${accountId}/status`, {
-        cache: 'no-store',
-      });
+      const res = await waServiceFetch(`/sessions/${accountId}/status`);
 
       if (!res.ok) {
         return NextResponse.json({
@@ -49,17 +47,17 @@ export async function POST(request: Request) {
     const action = body.action || 'start';
 
     try {
-      let endpoint = `${WA_SERVICE_URL}/sessions/${accountId}/${action}`;
+      let endpoint = `/sessions/${accountId}/${action}`;
       let reqBody: any = {};
 
       if (action === 'pairing-code') {
-        endpoint = `${WA_SERVICE_URL}/sessions/${accountId}/pairing-code`;
+        endpoint = `/sessions/${accountId}/pairing-code`;
         reqBody = { phone: body.phone };
       } else if (action === 'cancel-pairing-code') {
-        endpoint = `${WA_SERVICE_URL}/sessions/${accountId}/pairing-code/cancel`;
+        endpoint = `/sessions/${accountId}/pairing-code/cancel`;
       }
 
-      const res = await fetch(endpoint, {
+      const res = await waServiceFetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(reqBody),

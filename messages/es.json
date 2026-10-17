@@ -12,7 +12,10 @@
     "signingIn": "Iniciando sesión...",
     "signIn": "Iniciar sesión",
     "noAccount": "¿No tienes una cuenta?",
-    "createAccount": "Crear cuenta"
+    "createAccount": "Crear cuenta",
+    "or": "o",
+    "continueWithGoogle": "Continuar con Google",
+    "oauthError": "No se pudo iniciar sesión con Google. Intentá de nuevo."
   },
   "Sidebar": {
     "title": "Plantilla CRM para WhatsApp",

@@ -52,3 +52,6 @@ next-env.d.ts
 # whatsapp-web.js session & cache
 .wwebjs_auth/
 .wwebjs_cache/
+
+# Google OAuth client secrets (descargados de Google Cloud)
+client_secret*.json

@@ -21,28 +21,22 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-import {
-  sendTextMessage,
-  sendTemplateMessage,
-  sendMediaMessage,
-  sendInteractiveButtons,
-  sendInteractiveList,
-  type MediaKind,
-} from '@/lib/whatsapp/meta-api';
-import { sendTwilioMessage } from '@/lib/whatsapp/twilio-api';
+import type { MediaKind } from '@/lib/whatsapp/meta-api';
+import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder';
 import {
   validateInteractivePayload,
   interactivePayloadPreviewText,
   type InteractiveMessagePayload,
 } from '@/lib/whatsapp/interactive';
-import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
+import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
 import {
-  sanitizePhoneForMeta,
-  isValidE164,
-  phoneVariants,
-  isRecipientNotAllowedError,
-} from '@/lib/whatsapp/phone-utils';
+  resolveProvider,
+  sendWithPhoneVariants,
+  WhatsAppNotConfiguredError,
+  type OutboundMessage,
+  type WhatsAppProvider,
+} from '@/lib/whatsapp/providers';
 import type { MessageTemplate } from '@/types';
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard';
 import { checkActionAllowed, recordMessageSent } from '@/lib/saas/plans';
@@ -259,38 +253,15 @@ export async function sendMessageToConversation(
     );
   }
 
-  // WhatsApp config, account-scoped (Meta Cloud API).
-  // Optional when the account is connected via WhatsApp Web (QR) or Twilio.
-  const { data: config } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', accountId)
-    .maybeSingle();
-
-  let accessToken: string | null = null;
-  if (config?.access_token) {
-    try {
-      accessToken = decrypt(config.access_token);
-
-      // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
-      if (isLegacyFormat(config.access_token) && accessToken) {
-        void db
-          .from('whatsapp_config')
-          .update({ access_token: encrypt(accessToken) })
-          .eq('id', config.id)
-          .then(({ error }: { error: { message: string } | null }) => {
-            if (error) {
-              console.warn(
-                '[send-message] access_token GCM upgrade failed:',
-                error.message
-              );
-            }
-          });
-      }
-    } catch (decryptErr) {
-      console.warn('[send-message] access_token decryption failed:', decryptErr);
-      accessToken = null;
+  // Provider for this account (WA Web / Meta / Twilio).
+  let provider: WhatsAppProvider;
+  try {
+    provider = await resolveProvider(db, accountId);
+  } catch (err) {
+    if (err instanceof WhatsAppNotConfiguredError) {
+      throw new SendMessageError('whatsapp_not_configured', err.message, 400);
     }
+    throw err;
   }
 
   // Resolve the reply target to its Meta message_id. The parent must
@@ -342,187 +313,45 @@ export async function sendMessageToConversation(
     templateRow = data ?? null;
   }
 
-  const attempt = async (phone: string): Promise<string> => {
-    // ── WhatsApp Web Service (multi-tenant) — gratis, sin API externa ──
-    try {
-      const waServiceUrl = process.env.WA_SERVICE_URL || 'http://localhost:3001';
-      // 1. Intentar endpoint multi-tenant por cuenta
-      const sessionStatusRes = await fetch(`${waServiceUrl}/sessions/${accountId}/status`, { signal: AbortSignal.timeout(2000) });
-      if (sessionStatusRes.ok) {
-        const { status: waStatus } = await sessionStatusRes.json() as { status: string };
-        if (waStatus === 'ready') {
-          const sendRes = await fetch(`${waServiceUrl}/sessions/${accountId}/send`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              to: phone,
-              message: contentText || (messageType === 'template' ? `[Plantilla: ${templateName}]` : ''),
-              mediaUrl: mediaUrl || undefined,
-              contentType: messageType,
-              sendAudioAsVoice: messageType === 'audio',
-              fromCrm: true,
-            }),
-            signal: AbortSignal.timeout(15000),
-          });
-          if (sendRes.ok) {
-            const data = await sendRes.json() as { messageId?: string };
-            return data.messageId || `wa-web-${Date.now()}`;
-          }
+  const outbound: OutboundMessage =
+    messageType === 'template'
+      ? {
+          type: 'template',
+          name: templateName!,
+          language: templateLanguage || 'en_US',
+          template: templateRow,
+          params: templateParams || [],
+          messageParams: (templateMessageParams ?? undefined) as
+            | SendTimeParams
+            | undefined,
         }
-      }
+      : messageType === 'interactive'
+        ? { type: 'interactive', payload: interactivePayload! }
+        : isMediaKind
+          ? {
+              type: 'media',
+              kind: messageType as MediaKind,
+              url: mediaUrl!,
+              caption: contentText || undefined,
+              filename: filename || undefined,
+            }
+          : { type: 'text', text: contentText! };
 
-      // 2. Fallback por compatibilidad con sesión global legacy
-      const globalStatusRes = await fetch(`${waServiceUrl}/status`, { signal: AbortSignal.timeout(1500) });
-      if (globalStatusRes.ok) {
-        const { status: waStatus } = await globalStatusRes.json() as { status: string };
-        if (waStatus === 'ready') {
-          const sendRes = await fetch(`${waServiceUrl}/send`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              to: phone,
-              message: contentText || (messageType === 'template' ? `[Plantilla: ${templateName}]` : ''),
-              mediaUrl: mediaUrl || undefined,
-              fromCrm: true,
-            }),
-            signal: AbortSignal.timeout(15000),
-          });
-          if (sendRes.ok) {
-            const data = await sendRes.json() as { messageId?: string };
-            return data.messageId || `wa-web-${Date.now()}`;
-          }
-        }
-      }
-    } catch {
-      // Servicio no disponible, continuar con Twilio / Meta
-    }
-
-    if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-      const twilioFrom = process.env.TWILIO_PHONE_NUMBER || '+14155238886';
-      const result = await sendTwilioMessage({
-        accountSid: process.env.TWILIO_ACCOUNT_SID,
-        authToken: process.env.TWILIO_AUTH_TOKEN,
-        from: twilioFrom,
-        to: phone,
-        body: contentText || (messageType === 'template' ? `[Plantilla: ${templateName}]` : null),
-        mediaUrl: mediaUrl || null,
-      });
-      return result.messageSid;
-    }
-
-    // ── 3. Meta Cloud API (Oficial) ──
-    if (!config || !config.phone_number_id || !accessToken) {
-      throw new SendMessageError(
-        'whatsapp_not_configured',
-        'WhatsApp no está conectado ni configurado. Conecta tu WhatsApp escaneando el código QR en Ajustes o configura tus credenciales de Meta Cloud API.',
-        400
-      );
-    }
-
-    if (messageType === 'template') {
-      const result = await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        templateName: templateName!,
-        language: templateLanguage || 'en_US',
-        template: templateRow ?? undefined,
-        messageParams: templateMessageParams ?? undefined,
-        params: templateParams || [],
-        contextMessageId,
-      });
-      return result.messageId;
-    }
-    if (isMediaKind) {
-      const result = await sendMediaMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        kind: messageType as MediaKind,
-        link: mediaUrl!,
-        caption: contentText || undefined,
-        filename: filename || undefined,
-        contextMessageId,
-      });
-      return result.messageId;
-    }
-    if (messageType === 'interactive') {
-      const p = interactivePayload!;
-      if (p.kind === 'buttons') {
-        const result = await sendInteractiveButtons({
-          phoneNumberId: config.phone_number_id,
-          accessToken,
-          to: phone,
-          bodyText: p.body,
-          headerText: p.header || undefined,
-          footerText: p.footer || undefined,
-          buttons: p.buttons,
-          contextMessageId,
-        });
-        return result.messageId;
-      }
-      const result = await sendInteractiveList({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        bodyText: p.body,
-        buttonLabel: p.button_label,
-        headerText: p.header || undefined,
-        footerText: p.footer || undefined,
-        sections: p.sections,
-        contextMessageId,
-      });
-      return result.messageId;
-    }
-    const result = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      text: contentText!,
+  // Phone-variant retry; persist a working variant back to the contact
+  // so the next send goes straight through.
+  let waMessageId: string;
+  let workingPhone: string;
+  try {
+    const sent = await sendWithPhoneVariants(provider, sanitizedPhone, outbound, {
       contextMessageId,
     });
-    return result.messageId;
-  };
-
-  // Send via Meta — retry across phone-number variants if Meta rejects
-  // with "recipient not in allowed list"; persist a working variant
-  // back to the contact so the next send goes straight through.
-  let waMessageId = '';
-  let workingPhone = sanitizedPhone;
-  try {
-    const variants = phoneVariants(sanitizedPhone);
-    let lastError: unknown = null;
-
-    for (const variant of variants) {
-      try {
-        waMessageId = await attempt(variant);
-        workingPhone = variant;
-        lastError = null;
-        break;
-      } catch (err) {
-        if (err instanceof SendMessageError) {
-          throw err;
-        }
-        const message = err instanceof Error ? err.message : String(err);
-        if (!isRecipientNotAllowedError(message)) {
-          throw err;
-        }
-        lastError = err;
-        console.warn(
-          `[send-message] variant "${variant}" rejected by Meta, trying next…`
-        );
-      }
-    }
-
-    if (lastError) throw lastError;
+    waMessageId = sent.messageId;
+    workingPhone = sent.phone;
   } catch (err) {
-    if (err instanceof SendMessageError) {
-      throw err;
-    }
-    const message =
-      err instanceof Error ? err.message : 'Unknown Meta API error';
-    console.error('[send-message] Meta send failed for all variants:', message);
-    throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
+    const message = err instanceof Error ? err.message : 'Unknown provider error';
+    console.error(`[send-message] ${provider.id} send failed for all variants:`, message);
+    // Code kept as 'meta_error' — it is part of the public v1 API contract.
+    throw new SendMessageError('meta_error', `WhatsApp send error (${provider.id}): ${message}`, 502);
   }
 
   if (workingPhone !== sanitizedPhone) {

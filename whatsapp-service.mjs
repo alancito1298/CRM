@@ -30,6 +30,9 @@ const { Client, LocalAuth, MessageMedia } = pkg;
 
 // ─── Config global ──────────────────────────────────────────────────────────
 const PORT = process.env.WA_SERVICE_PORT || 3001;
+// Shared secret with the CRM. When set, every request must carry
+// `Authorization: Bearer <token>` (or `?token=` for the HTML pages).
+const SERVICE_TOKEN = process.env.WA_SERVICE_TOKEN || '';
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
@@ -1622,6 +1625,14 @@ async function loadAllSessions() {
 }
 
 // ─── HTTP Server ───────────────────────────────────────────────────────────────
+function isAuthorized(req, url) {
+  const header = req.headers['authorization'] || '';
+  const provided = header.startsWith('Bearer ') ? header.slice(7) : url.searchParams.get('token') || '';
+  const a = Buffer.from(provided);
+  const b = Buffer.from(SERVICE_TOKEN);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
@@ -1630,6 +1641,12 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  if (SERVICE_TOKEN && !isAuthorized(req, url)) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized' }));
+    return;
+  }
 
   const json = (data, code = 200) => {
     res.writeHead(code, { 'Content-Type': 'application/json' });

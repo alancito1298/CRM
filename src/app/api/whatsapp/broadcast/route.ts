@@ -1,15 +1,14 @@
 import { NextResponse } from 'next/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
-import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
-import { decrypt } from '@/lib/whatsapp/encryption'
 import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder'
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard'
+import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils'
 import {
-  sanitizePhoneForMeta,
-  isValidE164,
-  phoneVariants,
-  isRecipientNotAllowedError,
-} from '@/lib/whatsapp/phone-utils'
+  resolveProvider,
+  sendWithPhoneVariants,
+  WhatsAppNotConfiguredError,
+  type WhatsAppProvider,
+} from '@/lib/whatsapp/providers'
 import {
   checkRateLimit,
   rateLimitResponse,
@@ -120,50 +119,16 @@ export async function POST(request: Request) {
       )
     }
 
-    // ── 1. Check if WhatsApp Web is connected for this account ──
-    const waServiceUrl = process.env.WA_SERVICE_URL || 'http://localhost:3001'
-    let isWaWebReady = false
+    // Provider for this account (WA Web / Meta / Twilio).
+    let provider: WhatsAppProvider
     try {
-      const waStatusRes = await fetch(`${waServiceUrl}/sessions/${accountId}/status`, {
-        cache: 'no-store',
-        signal: AbortSignal.timeout(2000),
-      })
-      if (waStatusRes.ok) {
-        const { status } = await waStatusRes.json()
-        if (status === 'ready') isWaWebReady = true
+      provider = await resolveProvider(supabase, accountId)
+    } catch (err) {
+      if (err instanceof WhatsAppNotConfiguredError) {
+        return NextResponse.json({ error: err.message }, { status: 400 })
       }
-      if (!isWaWebReady) {
-        const globalStatusRes = await fetch(`${waServiceUrl}/status`, {
-          cache: 'no-store',
-          signal: AbortSignal.timeout(1500),
-        })
-        if (globalStatusRes.ok) {
-          const { status } = await globalStatusRes.json()
-          if (status === 'ready') isWaWebReady = true
-        }
-      }
-    } catch {
-      isWaWebReady = false
+      throw err
     }
-
-    // ── 2. WhatsApp Config (Meta API) if not using WhatsApp Web ──
-    const { data: config } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .maybeSingle()
-
-    if (!isWaWebReady && (!config || !config.phone_number_id || !config.access_token)) {
-      return NextResponse.json(
-        {
-          error:
-            'WhatsApp no está conectado ni configurado. Por favor, conecta tu WhatsApp escaneando el código QR en Ajustes o configura tus credenciales de Meta Cloud API.',
-        },
-        { status: 400 }
-      )
-    }
-
-    const accessToken = config?.access_token ? decrypt(config.access_token) : null
 
     // Load template row if available
     const { data: rawTemplateRow } = await supabase
@@ -174,7 +139,7 @@ export async function POST(request: Request) {
       .eq('language', template_language || 'en_US')
       .maybeSingle()
 
-    if (rawTemplateRow && !isMessageTemplate(rawTemplateRow) && !isWaWebReady) {
+    if (rawTemplateRow && !isMessageTemplate(rawTemplateRow) && provider.id === 'meta') {
       return NextResponse.json(
         {
           error:
@@ -188,48 +153,6 @@ export async function POST(request: Request) {
     const results: BroadcastResult[] = []
     let sentCount = 0
     let failedCount = 0
-
-    // Helper to render template text for WhatsApp Web
-    const renderMessageForWaWeb = (
-      params: string[] = [],
-      mediaUrl?: string
-    ): { text: string; mediaUrl?: string } => {
-      let body = templateRow?.body_text || `[${template_name}]`
-      params.forEach((val, idx) => {
-        const placeholder = new RegExp(`\\{\\{${idx + 1}\\}\\}`, 'g')
-        body = body.replace(placeholder, val || '')
-      })
-
-      const parts: string[] = []
-      if (templateRow?.header_type === 'text' && templateRow?.header_content) {
-        parts.push(`*${templateRow.header_content}*`)
-      }
-      if (body) {
-        parts.push(body)
-      }
-      if (templateRow?.footer_text) {
-        parts.push(`_${templateRow.footer_text}_`)
-      }
-      if (templateRow?.buttons && templateRow.buttons.length > 0) {
-        const btnTexts = templateRow.buttons
-          .map((b: any) => {
-            if (b.type === 'URL' && b.url) return `👉 ${b.text}: ${b.url}`
-            if (b.type === 'PHONE_NUMBER' && b.phone_number) return `📞 ${b.text}: ${b.phone_number}`
-            return `• ${b.text}`
-          })
-          .join('\n')
-        parts.push(btnTexts)
-      }
-
-      const finalMedia =
-        mediaUrl ||
-        (templateRow?.header_type !== 'text' ? templateRow?.header_media_url : undefined)
-
-      return {
-        text: parts.join('\n\n'),
-        mediaUrl: finalMedia || undefined,
-      }
-    }
 
     for (let i = 0; i < recipients.length; i++) {
       const recipient = recipients[i]
@@ -248,88 +171,24 @@ export async function POST(request: Request) {
       let sentMessageId: string | null = null
       let lastError: string | null = null
 
-      if (isWaWebReady) {
-        // ── Enviar mediante WhatsApp Web Service ──
-        try {
-          const { text, mediaUrl } = renderMessageForWaWeb(
-            recipient.params,
-            recipient.messageParams?.headerMediaUrl
-          )
+      try {
+        const sent = await sendWithPhoneVariants(provider, sanitized, {
+          type: 'template',
+          name: template_name,
+          language: template_language || 'en_US',
+          template: templateRow,
+          messageParams: recipient.messageParams,
+          params: recipient.params ?? [],
+        })
+        sentMessageId = sent.messageId
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : 'Unknown error'
+      }
 
-          // 1. Intentar endpoint multi-tenant por cuenta
-          const sendRes = await fetch(`${waServiceUrl}/sessions/${accountId}/send`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              to: sanitized,
-              message: text,
-              mediaUrl: mediaUrl || undefined,
-              fromCrm: true,
-            }),
-            signal: AbortSignal.timeout(15000),
-          })
-
-          if (sendRes.ok) {
-            const data = await sendRes.json()
-            sentMessageId = data.messageId || `wa-web-${Date.now()}`
-          } else {
-            // 2. Fallback endpoint global
-            const globalSendRes = await fetch(`${waServiceUrl}/send`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                to: sanitized,
-                message: text,
-                mediaUrl: mediaUrl || undefined,
-                fromCrm: true,
-              }),
-              signal: AbortSignal.timeout(15000),
-            })
-            if (globalSendRes.ok) {
-              const data = await globalSendRes.json()
-              sentMessageId = data.messageId || `wa-web-${Date.now()}`
-            } else {
-              const errData = await sendRes.json().catch(() => ({}))
-              lastError = errData.error || 'Error al enviar por WhatsApp Web'
-            }
-          }
-        } catch (err: any) {
-          lastError = err.message || 'Error de conexión con WhatsApp Web'
-        }
-
-        // Pacing anti-bloqueo para envíos por WhatsApp Web (1.5s - 2.5s)
-        if (i < recipients.length - 1) {
-          const delay = Math.floor(1500 + Math.random() * 1000)
-          await new Promise((r) => setTimeout(r, delay))
-        }
-      } else {
-        // ── Enviar mediante Meta Cloud API ──
-        const variants = phoneVariants(sanitized)
-        for (const variant of variants) {
-          try {
-            const result = await sendTemplateMessage({
-              phoneNumberId: config!.phone_number_id,
-              accessToken: accessToken!,
-              to: variant,
-              templateName: template_name,
-              language: template_language || 'en_US',
-              template: templateRow ?? undefined,
-              messageParams: recipient.messageParams,
-              params: recipient.params ?? [],
-            })
-            sentMessageId = result.messageId
-            lastError = null
-            break
-          } catch (error) {
-            const errorMessage =
-              error instanceof Error ? error.message : 'Unknown error'
-            if (!isRecipientNotAllowedError(errorMessage)) {
-              lastError = errorMessage
-              break
-            }
-            lastError = errorMessage
-          }
-        }
+      // Anti-ban pacing (only WA Web asks for it).
+      const delay = provider.bulkDelayMs()
+      if (delay > 0 && i < recipients.length - 1) {
+        await new Promise((r) => setTimeout(r, delay))
       }
 
       if (sentMessageId) {
