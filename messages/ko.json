@@ -139,6 +139,8 @@
       "filterOpen": "열림",
       "filterPending": "대기 중",
       "filterClosed": "닫힘",
+      "filterChannel": "채널별 필터",
+      "filterAllChannels": "모든 채널",
       "tags": "태그",
       "company": "회사",
       "allCompanies": "전체 회사",
@@ -180,6 +182,7 @@
     "composer": {
       "draftHint": "✨를 눌러 AI로 답장 초안을 작성하세요 — 보내기 전에 수정할 수 있습니다",
       "sessionExpiredHint": "24시간 세션이 만료되었습니다. 다시 연결하려면 템플릿을 사용하세요.",
+      "instagramWindowClosed": "Instagram의 24시간 답장 가능 시간이 지났습니다. 연락처에서 새 메시지가 올 때까지 기다려 주세요.",
       "templates": "템플릿",
       "readOnlyPlaceholder": "읽기 전용 — 뷰어는 열람만 가능하고 답장할 수 없습니다",
       "sessionExpiredPlaceholder": "세션 만료 - 템플릿을 사용하세요",
@@ -264,7 +267,12 @@
       "deals": "딜",
       "noTags": "태그 없음",
       "noDeals": "딜 없음",
-      "addNotePlaceholder": "메모 추가..."
+      "addNotePlaceholder": "메모 추가...",
+      "mergeTitle": "연락처 병합",
+      "mergeSearch": "다른 연락처 찾기",
+      "mergeConfirm": "{name}을(를) 이 연락처에 병합할까요? 대화와 기록이 여기로 이동합니다.",
+      "mergeSuccess": "연락처를 병합했습니다",
+      "mergeError": "연락처를 병합할 수 없습니다"
     },
     "aiBanner": {
       "pausedTitle": "이 대화에서 AI 어시스턴트가 일시 중지됨",

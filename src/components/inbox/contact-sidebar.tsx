@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { format } from "date-fns";
 import { useTranslations } from "next-intl";
+import { toast } from "sonner";
 
 interface ContactSidebarProps {
   contact: Contact | null;
@@ -31,13 +32,17 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
   const tSidebar = useTranslations("Inbox.sidebar");
   const tThread = useTranslations("Inbox.messageThread");
 
-  const { accountId } = useAuth();
+  const { accountId, canEditSettings } = useAuth();
   const [copied, setCopied] = useState(false);
   const [deals, setDeals] = useState<Deal[]>([]);
   const [notes, setNotes] = useState<ContactNote[]>([]);
   const [tags, setTags] = useState<(Tag & { contact_tag_id: string })[]>([]);
   const [newNote, setNewNote] = useState("");
   const [addingNote, setAddingNote] = useState(false);
+  const [identities, setIdentities] = useState<Array<{ id: string; channel_type: string; username: string | null; external_id: string }>>([]);
+  const [mergeSearch, setMergeSearch] = useState("");
+  const [mergeCandidates, setMergeCandidates] = useState<Array<{ id: string; name: string | null; phone: string | null }>>([]);
+  const [merging, setMerging] = useState(false);
 
   // MercadoPago Cobros state
   const [mpTitle, setMpTitle] = useState("");
@@ -52,7 +57,7 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
     const supabase = createClient();
 
     // Fetch deals, notes, and tags in parallel
-    const [dealsRes, notesRes, tagsRes] = await Promise.all([
+    const [dealsRes, notesRes, tagsRes, identitiesRes] = await Promise.all([
       supabase
         .from("deals")
         .select("*, stage:pipeline_stages(*)")
@@ -67,10 +72,13 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
         .from("contact_tags")
         .select("id, tag_id, tags(*)")
         .eq("contact_id", contact.id),
+      supabase.from("contact_identities").select("id, channel_type, username, external_id")
+        .eq("contact_id", contact.id).order("created_at"),
     ]);
 
     if (dealsRes.data) setDeals(dealsRes.data);
     if (notesRes.data) setNotes(notesRes.data);
+    setIdentities(identitiesRes.data ?? []);
     if (tagsRes.data) {
       const mapped = tagsRes.data
         .filter((ct: Record<string, unknown>) => ct.tags)
@@ -88,6 +96,44 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchContactData();
   }, [fetchContactData]);
+
+  useEffect(() => {
+    if (!accountId || !contact || mergeSearch.trim().length < 2) return;
+    let cancelled = false;
+    const supabase = createClient();
+    const term = mergeSearch.trim().replace(/[\\%_]/g, "\\$&");
+    Promise.all([
+      supabase.from("contacts").select("id,name,phone").eq("account_id", accountId)
+        .neq("id", contact.id).ilike("name", `%${term}%`).limit(10),
+      supabase.from("contacts").select("id,name,phone").eq("account_id", accountId)
+        .neq("id", contact.id).ilike("phone", `%${term}%`).limit(10),
+    ]).then((results) => {
+      if (cancelled) return;
+      const unique = new Map<string, { id: string; name: string | null; phone: string | null }>();
+      for (const result of results) for (const row of result.data ?? []) unique.set(row.id, row);
+      setMergeCandidates([...unique.values()]);
+    });
+    return () => { cancelled = true; };
+  }, [accountId, contact, mergeSearch]);
+
+  const handleMerge = async (candidate: { id: string; name: string | null; phone: string | null }) => {
+    if (!contact || !window.confirm(tSidebar("mergeConfirm", { name: candidate.name || candidate.phone || candidate.id }))) return;
+    setMerging(true);
+    try {
+      const response = await fetch("/api/contacts/merge", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ keep_id: contact.id, merge_id: candidate.id }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || tSidebar("mergeError"));
+      toast.success(tSidebar("mergeSuccess"));
+      window.location.reload();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : tSidebar("mergeError"));
+    } finally {
+      setMerging(false);
+    }
+  };
 
   const handleCopyPhone = useCallback(async () => {
     if (!contact?.phone) return;
@@ -169,7 +215,7 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
     );
   }
 
-  const displayName = contact.name || contact.phone || "Contact";
+  const displayName = contact.name || contact.phone || identities[0]?.username || "Contact";
   const initials = displayName.charAt(0).toUpperCase();
 
   return (
@@ -201,7 +247,7 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
 
           {/* Phone */}
           <div className="mt-4 space-y-2">
-            <button
+            {contact.phone && <button
               onClick={handleCopyPhone}
               className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted"
             >
@@ -212,7 +258,14 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
               ) : (
                 <Copy className="h-3 w-3 text-muted-foreground" />
               )}
-            </button>
+            </button>}
+
+            {identities.map((identity) => (
+              <div key={identity.id} className="flex items-center gap-2 rounded-lg px-3 py-1 text-xs text-muted-foreground">
+                <span className="font-medium capitalize">{identity.channel_type}</span>
+                <span className="truncate">{identity.username || identity.external_id}</span>
+              </div>
+            ))}
 
             {contact.email && (
               <div className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground">
@@ -224,6 +277,22 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
 
           {/* Divider */}
           <div className="my-4 border-t border-border" />
+
+          {canEditSettings && <div className="space-y-2">
+            <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">{tSidebar("mergeTitle")}</p>
+            <input value={mergeSearch} onChange={(event) => setMergeSearch(event.target.value)}
+              placeholder={tSidebar("mergeSearch")} aria-label={tSidebar("mergeSearch")}
+              className="w-full rounded border border-border bg-background px-2.5 py-2 text-xs" />
+            {mergeSearch.trim().length >= 2 && mergeCandidates.map((candidate) => (
+              <button key={candidate.id} type="button" disabled={merging} onClick={() => handleMerge(candidate)}
+                className="block w-full rounded border border-border px-2 py-1.5 text-left text-xs hover:bg-muted disabled:opacity-50">
+                <span className="block font-medium">{candidate.name || candidate.phone || candidate.id}</span>
+                {candidate.phone && <span className="text-muted-foreground">{candidate.phone}</span>}
+              </button>
+            ))}
+          </div>}
+
+          {canEditSettings && <div className="my-4 border-t border-border" />}
 
           {/* Tags */}
           <div>

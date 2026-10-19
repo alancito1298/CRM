@@ -228,6 +228,18 @@ export function MessageThread({
 
   // 24-hour session timer
   const sessionInfo = useMemo(() => {
+    if (conversation?.channel?.type === 'instagram') {
+      const lastInbound = Date.parse(conversation.last_inbound_at ?? '');
+      if (!Number.isFinite(lastInbound)) return { expired: true, remaining: tTimer('expired') };
+      const minutesLeft = Math.ceil((lastInbound + 24 * 60 * 60 * 1000 - Date.now()) / 60000);
+      if (minutesLeft <= 0) return { expired: true, remaining: tTimer('expired') };
+      return {
+        expired: false,
+        remaining: minutesLeft >= 60
+          ? tTimer('xhRemaining', { hours: Math.floor(minutesLeft / 60) })
+          : tTimer('xmRemaining', { minutes: minutesLeft }),
+      };
+    }
     if (!messages.length) return { expired: false, remaining: "" };
 
     // Find last customer message
@@ -251,7 +263,7 @@ export function MessageThread({
         : tTimer("xmRemaining", { minutes: Math.floor(hoursLeft * 60) });
 
     return { expired, remaining };
-  }, [messages, tTimer]);
+  }, [conversation?.channel?.type, conversation?.last_inbound_at, messages, tTimer]);
 
   // Store latest callback in a ref so fetchMessages doesn't need to
   // depend on `onMessagesLoaded` — otherwise parent re-renders cause
@@ -857,7 +869,7 @@ export function MessageThread({
     );
   }
 
-  const displayName = contact.name || contact.phone || "Contact";
+  const displayName = contact.name || contact.phone || 'Contact';
   const messageGroups = groupMessagesByDate(messages);
   const currentStatus = STATUS_OPTIONS.find(
     (s) => s.value === conversation.status
@@ -911,7 +923,9 @@ export function MessageThread({
           </div>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold text-foreground">{displayName}</h2>
-            <p className="truncate text-xs text-muted-foreground">{contact.phone}</p>
+            <p className="truncate text-xs text-muted-foreground">
+              {conversation.channel?.type === 'instagram' ? 'Instagram' : contact.phone}
+            </p>
           </div>
           {/* Session timer badge — hidden on the narrowest phones so
               the name + back arrow keep their room. */}
@@ -1124,7 +1138,7 @@ export function MessageThread({
                         key={msg.id}
                         message={msg}
                         onReply={() => handleStartReply(msg)}
-                        onReact={(emoji) => {
+                        onReact={conversation.channel?.type === 'instagram' ? undefined : (emoji) => {
                           if (emoji) void postReaction(msg.id, emoji);
                         }}
                       >
@@ -1133,7 +1147,7 @@ export function MessageThread({
                           reply={reply}
                           reactions={msgReactions}
                           currentUserId={user?.id}
-                          onToggleReaction={handlePillToggle}
+                          onToggleReaction={conversation.channel?.type === 'instagram' ? undefined : handlePillToggle}
                         />
                       </MessageActions>
                     );
@@ -1165,6 +1179,7 @@ export function MessageThread({
       <MessageComposer
         conversationId={conversation.id}
         sessionExpired={sessionInfo.expired}
+        channelType={conversation.channel?.type ?? 'whatsapp'}
         onSend={handleSend}
         onSendMedia={handleSendMedia}
         onSendInteractive={handleSendInteractive}
@@ -1173,11 +1188,11 @@ export function MessageThread({
         onClearReply={() => setReplyTo(null)}
       />
 
-      <TemplatePicker
+      {(conversation.channel?.type ?? 'whatsapp') === 'whatsapp' && <TemplatePicker
         open={templateModalOpen}
         onOpenChange={setTemplateModalOpen}
         onSelect={handleSendTemplate}
-      />
+      />}
     </div>
   );
 }

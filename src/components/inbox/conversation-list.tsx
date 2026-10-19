@@ -65,6 +65,7 @@ export function ConversationList({
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<InboxFilter>("all");
+  const [channelFilter, setChannelFilter] = useState<'all' | 'whatsapp' | 'instagram'>('all');
   const [loading, setLoading] = useState(true);
   // Contact-based filters (issue #272). Tags use OR logic (a conversation
   // matches if its contact carries any selected tag), consistent with
@@ -189,6 +190,10 @@ export function ConversationList({
       result = result.filter((c) => c.status === filter);
     }
 
+    if (channelFilter !== 'all') {
+      result = result.filter((c) => (c.channel?.type ?? 'whatsapp') === channelFilter);
+    }
+
     // Contact-based filters (tags via OR logic, exact company match).
     if (selectedTagIds.length > 0 || selectedCompany !== null) {
       result = result.filter((c) =>
@@ -210,7 +215,7 @@ export function ConversationList({
     }
 
     return result;
-  }, [conversations, filter, search, selectedTagIds, selectedCompany]);
+  }, [conversations, filter, channelFilter, search, selectedTagIds, selectedCompany]);
 
   const toggleTag = useCallback((id: string) => {
     setSelectedTagIds((prev) =>
@@ -259,6 +264,13 @@ export function ConversationList({
         </div>
 
         <div className="flex flex-wrap items-center gap-1">
+          <select aria-label={t("filterChannel")} value={channelFilter}
+            onChange={(event) => setChannelFilter(event.target.value as typeof channelFilter)}
+            className="h-7 rounded-md bg-muted px-2 text-xs text-foreground">
+            <option value="all">{t("filterAllChannels")}</option>
+            <option value="whatsapp">WhatsApp</option>
+            <option value="instagram">Instagram</option>
+          </select>
           <DropdownMenu>
             <DropdownMenuTrigger className="inline-flex items-center justify-center h-7 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground rounded-md hover:bg-muted">
                 {activeFilter?.label ?? t("filterAll")}
@@ -500,6 +512,10 @@ function ConversationItem({
         <div className="flex items-center justify-between gap-2">
           <span className="truncate text-sm font-medium text-foreground">
             {displayName}
+          </span>
+          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+            title={conversation.channel?.type ?? 'whatsapp'}>
+            {conversation.channel?.type === 'instagram' ? 'Instagram' : 'WhatsApp'}
           </span>
           <span className="shrink-0 text-[10px] text-muted-foreground">{timeAgo}</span>
         </div>

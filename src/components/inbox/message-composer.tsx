@@ -112,6 +112,7 @@ interface MediaDraft {
 interface MessageComposerProps {
   conversationId: string;
   sessionExpired: boolean;
+  channelType?: 'whatsapp' | 'instagram';
   onSend: (text: string, replyToId?: string) => void;
   onSendMedia: (payload: SendMediaPayload) => void;
   onSendInteractive: (payload: InteractiveMessagePayload, replyToId?: string) => void;
@@ -134,6 +135,7 @@ const OPUS_ENCODER_PATH = "/opus/encoderWorker.min.js";
 export function MessageComposer({
   conversationId,
   sessionExpired,
+  channelType = 'whatsapp',
   onSend,
   onSendMedia,
   onSendInteractive,
@@ -190,7 +192,8 @@ export function MessageComposer({
   const canSend = useCan("send-messages");
   const readOnly = !canSend;
   // Allow inputs if user has send permissions (WhatsApp Web has no 24h window limit)
-  const inputsDisabled = readOnly;
+  const instagramWindowClosed = channelType === 'instagram' && sessionExpired;
+  const inputsDisabled = readOnly || instagramWindowClosed;
 
   const clearTimer = useCallback(() => {
     if (timerRef.current !== null) {
@@ -514,14 +517,14 @@ export function MessageComposer({
       // Audio takes no caption (Meta rejects it). Everything else: the
       // trimmed caption, or undefined when blank.
       caption:
-        draft.kind === "audio" ? undefined : draft.caption.trim() || undefined,
+        draft.kind === "audio" || channelType === 'instagram' ? undefined : draft.caption.trim() || undefined,
       filename: draft.kind === "document" ? draft.filename : undefined,
       replyToId: replyTo?.id,
     });
     // The object is now owned by the sent message — clear without GC.
     setDraft(null);
     onClearReply?.();
-  }, [draft, busy, onSendMedia, replyTo?.id, onClearReply]);
+  }, [draft, busy, channelType, onSendMedia, replyTo?.id, onClearReply]);
 
   // Discard GCs the staged object — it was uploaded but never sent.
   const discardDraft = useCallback(() => {
@@ -549,9 +552,11 @@ export function MessageComposer({
       {sessionExpired && (
         <div className="mb-2 flex items-center justify-between rounded-lg bg-amber-500/10 px-3 py-2">
           <p className="text-xs text-amber-400">
-            {t("sessionExpiredHint")}
+            {channelType === 'instagram'
+              ? t("instagramWindowClosed")
+              : t("sessionExpiredHint")}
           </p>
-          <Button
+          {channelType === 'whatsapp' && <Button
             variant="ghost"
             size="sm"
             className="h-7 text-xs text-amber-400 hover:text-amber-300"
@@ -559,7 +564,7 @@ export function MessageComposer({
           >
             <LayoutTemplate className="mr-1 h-3 w-3" />
             {t("templates")}
-          </Button>
+          </Button>}
         </div>
       )}
 
@@ -600,6 +605,7 @@ export function MessageComposer({
           draft={draft}
           busy={busy}
           readOnly={readOnly}
+          allowCaption={channelType !== 'instagram'}
           onCaptionChange={setCaption}
           onDiscard={discardDraft}
           onSend={sendDraft}
@@ -686,10 +692,10 @@ export function MessageComposer({
               <Plus className="h-4 w-4" />
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="border-border bg-popover">
-              <DropdownMenuItem onClick={() => openInteractiveBuilder()}>
+              {channelType === 'whatsapp' && <DropdownMenuItem onClick={() => openInteractiveBuilder()}>
                 <MessageSquareDashed className="mr-2 h-4 w-4" />
                 {t("interactiveMessage")}
-              </DropdownMenuItem>
+              </DropdownMenuItem>}
               <DropdownMenuItem onClick={() => setQuickReplyOpen(true)}>
                 <Zap className="mr-2 h-4 w-4" />
                 {t("quickReplies")}
@@ -697,7 +703,7 @@ export function MessageComposer({
             </DropdownMenuContent>
           </DropdownMenu>
 
-          <GatedButton
+          {channelType === 'whatsapp' && <GatedButton
             variant="ghost"
             size="sm"
             canAct={!readOnly}
@@ -707,7 +713,7 @@ export function MessageComposer({
             onClick={onOpenTemplates}
           >
             <LayoutTemplate className="h-4 w-4" />
-          </GatedButton>
+          </GatedButton>}
 
           <GatedButton
             variant="ghost"
@@ -736,7 +742,7 @@ export function MessageComposer({
                 ? t("readOnlyPlaceholder")
                 : t("typeMessagePlaceholder")
             }
-            disabled={readOnly}
+            disabled={inputsDisabled}
             rows={1}
             // Textarea keeps its own inline title — the GatedButton
             // wrapping pattern doesn't apply to non-button inputs.
@@ -752,7 +758,7 @@ export function MessageComposer({
             size="sm"
             canAct={!readOnly}
             gateReason="send messages"
-            disabled={!text.trim() || sending}
+            disabled={inputsDisabled || !text.trim() || sending}
             onClick={handleSend}
             className="h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40"
           >
@@ -823,6 +829,7 @@ function MediaDraftPreview({
   draft,
   busy,
   readOnly,
+  allowCaption,
   onCaptionChange,
   onDiscard,
   onSend,
@@ -831,6 +838,7 @@ function MediaDraftPreview({
   draft: MediaDraft;
   busy: boolean;
   readOnly: boolean;
+  allowCaption: boolean;
   onCaptionChange: (caption: string) => void;
   onDiscard: () => void;
   onSend: () => void;
@@ -872,7 +880,7 @@ function MediaDraftPreview({
       </div>
 
       <div className="mt-2 flex items-end gap-2">
-        {draft.kind !== "audio" && (
+        {allowCaption && draft.kind !== "audio" && (
           <input
             value={draft.caption}
             maxLength={MEDIA_CAPTION_MAX}

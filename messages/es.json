@@ -139,6 +139,8 @@
       "filterOpen": "Open",
       "filterPending": "Pending",
       "filterClosed": "Closed",
+      "filterChannel": "Filtrar por canal",
+      "filterAllChannels": "Todos los canales",
       "tags": "Tags",
       "company": "Company",
       "allCompanies": "All companies",
@@ -180,6 +182,7 @@
     "composer": {
       "draftHint": "Tap the ✨ to draft a reply with AI — you can edit it before sending",
       "sessionExpiredHint": "24-hour session expired. Use a template to re-engage.",
+      "instagramWindowClosed": "Terminó la ventana de 24 horas de Instagram. Esperá un nuevo mensaje del contacto.",
       "templates": "Templates",
       "readOnlyPlaceholder": "Read-only — viewers can browse but not reply",
       "sessionExpiredPlaceholder": "Session expired - use a template",
@@ -264,7 +267,12 @@
       "deals": "Deals",
       "noTags": "No tags",
       "noDeals": "No deals",
-      "addNotePlaceholder": "Add a note..."
+      "addNotePlaceholder": "Add a note...",
+      "mergeTitle": "Unir contactos",
+      "mergeSearch": "Buscar otro contacto",
+      "mergeConfirm": "¿Unir {name} con este contacto? Sus conversaciones e historial pasarán aquí.",
+      "mergeSuccess": "Contactos unidos",
+      "mergeError": "No se pudieron unir los contactos"
     },
     "aiBanner": {
       "pausedTitle": "AI assistant is paused here",
