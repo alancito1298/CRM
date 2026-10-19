@@ -29,7 +29,7 @@ dotenv.config({ path: '.env.local' });
 const { Client, LocalAuth, MessageMedia } = pkg;
 
 // ─── Config global ──────────────────────────────────────────────────────────
-const PORT = process.env.WA_SERVICE_PORT || 3001;
+const PORT = process.env.PORT || process.env.WA_SERVICE_PORT || 3001;
 // Shared secret with the CRM. When set, every request must carry
 // `Authorization: Bearer <token>` (or `?token=` for the HTML pages).
 const SERVICE_TOKEN = process.env.WA_SERVICE_TOKEN || '';
