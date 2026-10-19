@@ -40,6 +40,7 @@ export function InstagramConfig() {
   const [status, setStatus] = useState<InstagramStatus | null>(null);
   const [error, setError] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [importingId, setImportingId] = useState<string | null>(null);
 
   const load = useCallback(() => {
     fetch('/api/instagram/status', { cache: 'no-store' })
@@ -68,6 +69,25 @@ export function InstagramConfig() {
       toast.error(t('disconnectError'));
     } finally {
       setBusyId(null);
+    }
+  };
+
+  const importHistory = async (account: InstagramAccount) => {
+    setBusyId(account.id);
+    setImportingId(account.id);
+    try {
+      const response = await fetch('/api/instagram/import', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channelId: account.id }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error('import failed');
+      toast.success(t('importSuccess', data));
+    } catch {
+      toast.error(t('importError'));
+    } finally {
+      setBusyId(null);
+      setImportingId(null);
     }
   };
 
@@ -116,6 +136,12 @@ export function InstagramConfig() {
                           className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground">
                           {t('reconnect')}
                         </a>
+                      )}
+                      {!needsReconnect && (
+                        <Button variant="outline" size="sm" disabled={busyId === account.id}
+                          onClick={() => importHistory(account)}>
+                          {importingId === account.id ? t('importing') : t('import')}
+                        </Button>
                       )}
                       <Button variant="outline" size="sm" disabled={busyId === account.id}
                         onClick={() => disconnect(account)}>

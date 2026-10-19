@@ -1699,6 +1699,10 @@
       "disconnectSuccess": "Cuenta desconectada.",
       "disconnectError": "No se pudo desconectar la cuenta.",
       "limitInfo": "{used} de {limit} cuentas de tu plan",
+      "import": "Importar historial",
+      "importing": "Importando…",
+      "importSuccess": "Se importaron {conversations} conversaciones, {messages} mensajes y {commenters} contactos nuevos de comentarios.",
+      "importError": "No se pudo importar el historial. Reconectá la cuenta e intentá de nuevo.",
       "replyWindow": "Solo se puede responder después de recibir un mensaje. La ventana estándar es de 24 horas."
     },
     "aiKnowledge": {

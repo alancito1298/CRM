@@ -1699,6 +1699,10 @@
       "disconnectSuccess": "Account disconnected.",
       "disconnectError": "Could not disconnect the account.",
       "limitInfo": "{used} of {limit} accounts on your plan",
+      "import": "Import history",
+      "importing": "Importing…",
+      "importSuccess": "Imported {conversations} conversations, {messages} messages and {commenters} new contacts from comments.",
+      "importError": "Could not import the history. Reconnect the account and try again.",
       "replyWindow": "You can only reply after receiving a message. The standard window is 24 hours."
     },
     "aiKnowledge": {
