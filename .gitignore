@@ -55,3 +55,7 @@ next-env.d.ts
 
 # Google OAuth client secrets (descargados de Google Cloud)
 client_secret*.json
+
+# Capturas y archivos locales de herramientas (Playwright MCP, assets sueltos)
+.playwright-mcp/
+artifacts/
