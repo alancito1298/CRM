@@ -1444,6 +1444,17 @@
       "ownerHint": "계정과 결제에 대한 전체 권한"
     },
     "whatsapp": {
+      "embeddedSignup": {
+        "title": "WhatsApp 연결 (공식)",
+        "description": "Facebook으로 로그인하고 WhatsApp Business 번호를 선택하거나 만들면 끝입니다. Meta 공식 API를 사용하므로 별도 서비스를 실행할 필요가 없습니다.",
+        "connect": "WhatsApp 연결",
+        "connectBusinessApp": "휴대폰에서 이미 WhatsApp Business를 사용 중입니다",
+        "hint": "휴대폰의 WhatsApp Business 앱을 계속 함께 사용하려면 두 번째 옵션을 사용하세요.",
+        "connected": "WhatsApp이 연결되었습니다.",
+        "connectedWithWarning": "WhatsApp이 연결되었지만 Meta가 수신 메시지용으로 번호를 등록하지 않았습니다. 아래 상태를 확인하세요.",
+        "inUse": "이 번호는 이미 다른 CRM 워크스페이스에 연결되어 있습니다.",
+        "error": "연결을 완료할 수 없습니다. 다시 시도해 주세요."
+      },
       "title": "WhatsApp 연결",
       "description": "Meta WhatsApp 비즈니스 API를 연결하세요. 자격 증명, 웹훅, 설정 단계가 모두 여기 있습니다.",
       "tokenCorrupted": "저장된 토큰을 복호화할 수 없습니다",

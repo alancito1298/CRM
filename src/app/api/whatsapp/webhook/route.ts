@@ -99,6 +99,13 @@ export async function GET(request: Request) {
       )
     }
 
+    // App-level token: the one webhook every Embedded Signup account
+    // shares, configured once in the Meta app (no per-account token).
+    const appToken = process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN
+    if (appToken && verifyToken === appToken) {
+      return new Response(challenge, { status: 200, headers: { 'Content-Type': 'text/plain' } })
+    }
+
     // Fetch all whatsapp configs to check verify tokens
     const { data: configs, error: configError } = await supabaseAdmin()
       .from('whatsapp_config')

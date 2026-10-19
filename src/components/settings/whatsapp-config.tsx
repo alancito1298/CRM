@@ -30,6 +30,7 @@ import {
   AccordionContent,
 } from '@/components/ui/accordion';
 import { WhatsAppWebCard } from './whatsapp-web-card';
+import { WhatsAppEmbeddedSignup } from './whatsapp-embedded-signup';
 import type { WhatsAppConfig as WhatsAppConfigType } from '@/types';
 
 const MASKED_TOKEN = '••••••••••••••••';
@@ -394,6 +395,9 @@ export function WhatsAppConfig() {
         title={t("title")}
         description={t("description")}
       />
+
+      {/* Official one-click connection (Meta Embedded Signup). */}
+      <WhatsAppEmbeddedSignup onConnected={() => { if (accountId) void fetchConfig(accountId); }} />
 
       {/* WhatsApp Web (QR) Multi-Tenant — Opción sin API externa */}
       <div>

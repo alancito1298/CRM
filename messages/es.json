@@ -1434,6 +1434,17 @@
       "ownerHint": "Full control over account and billing"
     },
     "whatsapp": {
+      "embeddedSignup": {
+        "title": "Conectar WhatsApp (oficial)",
+        "description": "Iniciá sesión con Facebook, elegí o creá tu número de WhatsApp Business y listo. Usa la API oficial de Meta: no hay que levantar ningún servicio aparte.",
+        "connect": "Conectar WhatsApp",
+        "connectBusinessApp": "Ya uso WhatsApp Business en el celular",
+        "hint": "Usá la segunda opción para seguir usando la app de WhatsApp Business en el celular al mismo tiempo.",
+        "connected": "WhatsApp conectado.",
+        "connectedWithWarning": "WhatsApp se conectó, pero Meta no registró el número para recibir mensajes. Revisá el estado más abajo.",
+        "inUse": "Ese número ya está conectado a otro CRM.",
+        "error": "No se pudo completar la conexión. Intentá de nuevo."
+      },
       "title": "WhatsApp connection",
       "description": "Connect your Meta WhatsApp Business API. Credentials, webhook, and setup steps all live here.",
       "tokenCorrupted": "Stored token can't be decrypted",
