@@ -92,6 +92,14 @@ export const STATIC_PLANS: Plan[] = [
   },
 ];
 
+/** Instagram professional accounts a CRM account may connect at once. */
+export const INSTAGRAM_ACCOUNTS_BY_PLAN: Record<PlanSlug, number> = {
+  free: 1,
+  starter: 2,
+  pro: 5,
+  enterprise: 20,
+};
+
 export async function getAccountPlanDetails(
   supabase: SupabaseClient,
   accountId: string

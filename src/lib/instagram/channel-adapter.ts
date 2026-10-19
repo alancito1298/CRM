@@ -1,6 +1,8 @@
 import type { ChannelAdapter } from '@/lib/channels/types';
 import { ChannelNotConfiguredError, UnsupportedMessageError } from '@/lib/channels/types';
-import { getInstagramToken, sendInstagramMessage } from './client';
+import {
+  getInstagramToken, InstagramAuthError, markInstagramExpired, sendInstagramMessage,
+} from './client';
 
 export const instagramChannel: ChannelAdapter = {
   type: 'instagram',
@@ -30,13 +32,19 @@ export const instagramChannel: ChannelAdapter = {
     const media = message.type === 'media'
       ? { type: message.kind === 'document' ? 'file' as const : message.kind, url: message.url }
       : undefined;
-    const messageId = await sendInstagramMessage({
-      userId: channel.external_id,
-      recipientId: recipient.externalId,
-      token: await getInstagramToken(accountId, channel.id),
-      ...(message.type === 'text' ? { text: message.text } : { media }),
-      replyTo: options?.contextMessageId,
-    });
-    return { messageId, via: 'instagram' };
+    try {
+      const messageId = await sendInstagramMessage({
+        userId: channel.external_id,
+        recipientId: recipient.externalId,
+        token: await getInstagramToken(accountId, channel.id),
+        ...(message.type === 'text' ? { text: message.text } : { media }),
+        replyTo: options?.contextMessageId,
+      });
+      return { messageId, via: 'instagram' };
+    } catch (error) {
+      if (!(error instanceof InstagramAuthError)) throw error;
+      await markInstagramExpired(channel.id);
+      throw new ChannelNotConfiguredError('instagram', 'Instagram access expired; reconnect the account in Settings');
+    }
   },
 };

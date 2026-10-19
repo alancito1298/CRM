@@ -55,13 +55,66 @@ export async function exchangeInstagramCode(code: string, redirectUri: string) {
   // The OAuth user_id is app-scoped; webhooks and /messages use the
   // professional account ID, which only /me?fields=user_id returns.
   const meUrl = new URL(`${GRAPH}/me`);
-  meUrl.searchParams.set('fields', 'user_id');
+  meUrl.searchParams.set('fields', 'user_id,username');
   const meResponse = await fetch(meUrl, {
     headers: { Authorization: `Bearer ${longData.access_token}` }, cache: 'no-store',
   });
-  const me = await meResponse.json() as { user_id?: string | number };
+  const me = await meResponse.json() as { user_id?: string | number; username?: string };
   if (!meResponse.ok || !me.user_id) throw new Error('Instagram account lookup failed');
-  return { userId: String(me.user_id), token: longData.access_token, expiresIn: longData.expires_in };
+  return {
+    userId: String(me.user_id),
+    oauthUserId: userId,
+    username: me.username ?? null,
+    token: longData.access_token,
+    expiresIn: longData.expires_in,
+  };
+}
+
+/** The token was revoked or expired: the account must be reconnected. */
+export class InstagramAuthError extends Error {}
+
+const WEBHOOK_FIELDS = 'messages,messaging_postbacks,message_reactions';
+
+/** Subscribe the connected account to this app's webhooks (no Meta dashboard step). */
+export async function subscribeInstagramWebhooks(token: string): Promise<void> {
+  const url = new URL(`${GRAPH}/me/subscribed_apps`);
+  url.searchParams.set('subscribed_fields', WEBHOOK_FIELDS);
+  const response = await fetch(url, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}` }, cache: 'no-store',
+  });
+  const data = await response.json().catch(() => ({})) as { success?: boolean };
+  if (!response.ok || !data.success) throw new Error('Instagram webhook subscription failed');
+}
+
+/** Best effort: stop deliveries for an account being disconnected. */
+export async function unsubscribeInstagramWebhooks(token: string): Promise<void> {
+  await fetch(`${GRAPH}/me/subscribed_apps`, {
+    method: 'DELETE', headers: { Authorization: `Bearer ${token}` }, cache: 'no-store',
+  }).catch(() => undefined);
+}
+
+export interface InstagramProfile {
+  name: string | null;
+  username: string | null;
+  profilePic: string | null;
+}
+
+/** Public profile of someone who messaged the account; null when Meta withholds it. */
+export async function fetchInstagramProfile(igsid: string, token: string): Promise<InstagramProfile | null> {
+  const url = new URL(`${GRAPH}/${encodeURIComponent(igsid)}`);
+  url.searchParams.set('fields', 'name,username,profile_pic');
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` }, cache: 'no-store',
+  }).catch(() => null);
+  if (!response?.ok) return null;
+  const data = await response.json() as { name?: string; username?: string; profile_pic?: string };
+  return { name: data.name ?? null, username: data.username ?? null, profilePic: data.profile_pic ?? null };
+}
+
+/** Flag a channel whose token stopped working so the UI asks to reconnect. */
+export async function markInstagramExpired(channelId: string): Promise<void> {
+  await supabaseAdmin().from('channels').update({ status: 'error' })
+    .eq('id', channelId).eq('type', 'instagram');
 }
 
 export async function getInstagramToken(accountId: string, channelId: string): Promise<string> {
@@ -73,7 +126,10 @@ export async function getInstagramToken(accountId: string, channelId: string): P
 
   const token = decrypt(data.access_token);
   const expiresAt = Date.parse(data.token_expires_at);
-  if (expiresAt <= Date.now()) throw new Error('Instagram token expired; reconnect the account');
+  if (expiresAt <= Date.now()) {
+    await markInstagramExpired(channelId);
+    throw new InstagramAuthError('Instagram token expired; reconnect the account');
+  }
   // Meta only accepts refresh after the long-lived token is at least 24h old.
   if (expiresAt - Date.now() > 7 * 24 * 60 * 60 * 1000 ||
       Date.now() - Date.parse(data.token_issued_at) < 24 * 60 * 60 * 1000) return token;
@@ -116,6 +172,8 @@ export async function sendInstagramMessage(args: {
     cache: 'no-store',
   });
   const data = await response.json();
+  // 190 = invalid/expired/revoked access token.
+  if (data?.error?.code === 190) throw new InstagramAuthError('Instagram access was revoked');
   if (!response.ok || !data.message_id) throw new Error('Instagram message send failed');
   return data.message_id as string;
 }

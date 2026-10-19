@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireRole } from '@/lib/auth/account';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
 import { encrypt } from '@/lib/whatsapp/encryption';
-import { exchangeInstagramCode } from '@/lib/instagram/client';
+import { exchangeInstagramCode, subscribeInstagramWebhooks } from '@/lib/instagram/client';
+import { getAccountPlanDetails, INSTAGRAM_ACCOUNTS_BY_PLAN } from '@/lib/saas/plans';
 
 export async function GET(request: NextRequest) {
   const settingsUrl = new URL('/settings?tab=instagram', request.url);
@@ -35,11 +36,32 @@ export async function GET(request: NextRequest) {
     }
     const token = await exchangeInstagramCode(code, redirectUri);
     const db = supabaseAdmin();
-    const { data: existing } = await db.from('channels').select('id')
-      .eq('account_id', ctx.accountId).eq('type', 'instagram').maybeSingle();
+
+    // A professional account belongs to one CRM account at a time.
+    const { data: owner } = await db.from('instagram_connections').select('account_id')
+      .eq('instagram_user_id', token.userId).maybeSingle();
+    if (owner && owner.account_id !== ctx.accountId) return response('in_use');
+
+    // Reconnecting reuses the account's channel row (keeps its history);
+    // a new account counts against the plan limit.
+    const { data: existing } = await db.from('channels').select('id, status')
+      .eq('account_id', ctx.accountId).eq('type', 'instagram')
+      .eq('external_id', token.userId).order('created_at').limit(1).maybeSingle();
+    if (!existing || existing.status === 'disconnected') {
+      const [{ count }, plan] = await Promise.all([
+        db.from('channels').select('id', { count: 'exact', head: true })
+          .eq('account_id', ctx.accountId).eq('type', 'instagram').neq('status', 'disconnected'),
+        getAccountPlanDetails(ctx.supabase, ctx.accountId),
+      ]);
+      if ((count ?? 0) >= INSTAGRAM_ACCOUNTS_BY_PLAN[plan.plan_slug]) return response('limit_reached');
+    }
+
     const channelPayload = {
-      account_id: ctx.accountId, type: 'instagram', name: 'Instagram',
+      account_id: ctx.accountId, type: 'instagram',
+      name: token.username ? `@${token.username}` : 'Instagram',
       status: 'connected', external_id: token.userId,
+      // Deauthorize callbacks identify the user by the OAuth-scoped id.
+      metadata: { oauth_user_id: token.oauthUserId },
     };
     const channelResult = existing
       ? await db.from('channels').update(channelPayload).eq('id', existing.id).select('id').single()
@@ -57,8 +79,15 @@ export async function GET(request: NextRequest) {
       access_token: encrypt(token.token),
       token_issued_at: now.toISOString(),
       token_expires_at: new Date(now.getTime() + token.expiresIn * 1000).toISOString(),
-    }, { onConflict: 'account_id' });
+    }, { onConflict: 'channel_id' });
     if (connectionResult.error) throw new Error('Could not save Instagram connection');
+
+    try {
+      await subscribeInstagramWebhooks(token.token);
+    } catch (error) {
+      console.error('[instagram] webhook subscription failed:', error);
+      return response('subscribe_failed');
+    }
     return response('connected');
   } catch (error) {
     console.error('[instagram] OAuth callback failed:', error);
