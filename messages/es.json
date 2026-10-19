@@ -1502,6 +1502,7 @@
       "security": "Login & security",
       "appearance": "Appearance",
       "whatsapp": "WhatsApp",
+      "instagram": "Instagram",
       "templates": "Templates",
       "quick-replies": "Quick replies",
       "fields": "Fields & tags",
@@ -1666,6 +1667,18 @@
       "saveFailed": "Error al guardar la configuración.",
       "removeSuccess": "Configuración de IA eliminada.",
       "removeFailed": "Error al eliminar la configuración."
+    },
+    "instagramConfig": {
+      "description": "Conectá una cuenta profesional para responder mensajes directos desde el inbox.",
+      "connected": "Cuenta conectada: {id}",
+      "disconnected": "Instagram no está conectado.",
+      "statusError": "No se pudo consultar la conexión.",
+      "connectError": "No se pudo completar la conexión. Intentá de nuevo.",
+      "invalidState": "La solicitud venció. Intentá de nuevo.",
+      "connectSuccess": "Cuenta conectada correctamente.",
+      "connect": "Conectar Instagram",
+      "reconnect": "Reconectar Instagram",
+      "replyWindow": "Solo se puede responder después de recibir un mensaje. La ventana estándar es de 24 horas."
     },
     "aiKnowledge": {
       "loadFailed": "Error al cargar la base de conocimientos",

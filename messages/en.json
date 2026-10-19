@@ -1502,6 +1502,7 @@
       "security": "Login & security",
       "appearance": "Appearance",
       "whatsapp": "WhatsApp",
+      "instagram": "Instagram",
       "templates": "Templates",
       "quick-replies": "Quick replies",
       "fields": "Fields & tags",
@@ -1666,6 +1667,18 @@
       "saveFailed": "Failed to save.",
       "removeSuccess": "AI configuration removed.",
       "removeFailed": "Failed to remove."
+    },
+    "instagramConfig": {
+      "description": "Connect a professional account to reply to direct messages from the inbox.",
+      "connected": "Connected account: {id}",
+      "disconnected": "Instagram is not connected.",
+      "statusError": "Could not check the Instagram connection.",
+      "connectError": "Could not complete the connection. Try again.",
+      "invalidState": "The request expired. Try again.",
+      "connectSuccess": "Account connected successfully.",
+      "connect": "Connect Instagram",
+      "reconnect": "Reconnect Instagram",
+      "replyWindow": "You can reply only after receiving a message. The standard reply window is 24 hours."
     },
     "aiKnowledge": {
       "loadFailed": "Failed to load knowledge base",

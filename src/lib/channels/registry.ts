@@ -1,4 +1,5 @@
 import { whatsappChannel } from '@/lib/whatsapp/channel-adapter';
+import { instagramChannel } from '@/lib/instagram/channel-adapter';
 import {
   ChannelNotConfiguredError,
   UnsupportedMessageError,
@@ -12,6 +13,7 @@ import {
 // adapter and registering it here; nothing else branches on the type.
 const ADAPTERS: Partial<Record<ChannelType, ChannelAdapter>> = {
   whatsapp: whatsappChannel,
+  instagram: instagramChannel,
 };
 
 export function getChannelAdapter(type: ChannelType): ChannelAdapter {

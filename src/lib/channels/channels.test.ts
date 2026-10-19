@@ -53,6 +53,17 @@ describe('routeFromConversation', () => {
       routeFromConversation({ id: 'cv-1', contact, channel: { id: 'ch-2', type: 'instagram' } })
     ).toThrow(/no instagram address/);
   });
+
+  it('routes an Instagram identity through Instagram', () => {
+    const route = routeFromConversation({
+      id: 'cv-1',
+      contact: { id: 'ct-1', phone: null },
+      channel: { id: 'ch-2', type: 'instagram' },
+      identity: { id: 'id-2', channel_type: 'instagram', external_id: 'IGSID-1' },
+    });
+    expect(route.adapter.type).toBe('instagram');
+    expect(route.recipient.externalId).toBe('IGSID-1');
+  });
 });
 
 describe('assertChannelSupports', () => {
