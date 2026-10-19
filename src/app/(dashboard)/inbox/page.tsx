@@ -216,14 +216,25 @@ function InboxPageInner() {
           return;
         }
 
-        const { data } = await supabase
-          .from("whatsapp_config")
-          .select("status")
-          .eq("account_id", accountId)
-          .maybeSingle();
+        // Any other connected channel (e.g. Instagram) also means the
+        // inbox works, so the "WhatsApp not connected" banner stays off.
+        const [{ data }, { count: connectedChannels }] = await Promise.all([
+          supabase
+            .from("whatsapp_config")
+            .select("status")
+            .eq("account_id", accountId)
+            .maybeSingle(),
+          supabase
+            .from("channels")
+            .select("id", { count: "exact", head: true })
+            .eq("account_id", accountId)
+            .eq("status", "connected"),
+        ]);
 
         if (mounted) {
-          setWhatsappConnected(data?.status === "connected" || data?.status === "ready");
+          setWhatsappConnected(
+            data?.status === "connected" || data?.status === "ready" || (connectedChannels ?? 0) > 0
+          );
         }
       } catch {
         if (mounted) setWhatsappConnected(false);
