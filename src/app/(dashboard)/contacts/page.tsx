@@ -606,7 +606,7 @@ export default function ContactsPage() {
                         {contact.avatar_url ? (
                           <img
                             src={contact.avatar_url}
-                            alt={contact.name || contact.phone}
+                            alt={contact.name || contact.phone || 'Contact'}
                             className="h-full w-full object-cover"
                             onError={(e) => {
                               (e.currentTarget as HTMLElement).style.display = "none";

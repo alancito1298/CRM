@@ -1,12 +1,12 @@
 import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
-import { sendBotMessage } from '@/lib/whatsapp/bot-send'
+import { sendBotMessage } from '@/lib/channels/bot-send'
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard'
 import { supabaseAdmin } from './admin-client'
 
 // ------------------------------------------------------------
 // Automation-side sender. Thin adapter over `sendBotMessage`, which
-// owns provider resolution (WA Web / Meta / Twilio), phone-variant
-// retry and persistence for every bot send.
+// routes through the conversation's channel (WhatsApp, Instagram, …)
+// and owns persistence for every bot send.
 // ------------------------------------------------------------
 
 interface EngineArgs {

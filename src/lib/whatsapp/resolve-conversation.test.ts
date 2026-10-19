@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { resolveConversationByPhone } from './resolve-conversation';
-import { SendMessageError } from './send-message';
+import { SendMessageError } from '@/lib/channels/send-message';
 
 // ------------------------------------------------------------
 // Chainable Supabase stub, scripted per table. Terminal methods
@@ -101,6 +101,7 @@ function makeDb(script: Script): SupabaseClient {
   };
 
   return {
+    rpc: async () => ({ data: 'ch-wa', error: null }),
     from: (t: string) => {
       table = t;
       mode = 'select';

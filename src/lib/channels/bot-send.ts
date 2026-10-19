@@ -1,29 +1,27 @@
 // ============================================================
 // Bot-side outbound send (Flows, Automations, AI auto-reply).
 //
-// One implementation of: account-scoped contact lookup → provider
-// resolution → phone-variant retry → contact auto-fix → persist the
-// `messages` row (sender_type='bot') → bump the conversation preview.
+// One implementation of: account-scoped conversation lookup → channel
+// routing → send → persist the `messages` row (sender_type='bot') →
+// bump the conversation preview.
 //
 // Uses the service-role client (engines run without cookies), so every
 // lookup is filtered by `account_id` — otherwise a user could fire their
-// own automation against another tenant's contact UUID.
+// own automation against another tenant's conversation UUID.
 // ============================================================
 
 import { supabaseAdmin } from '@/lib/flows/admin-client';
-import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
-import {
-  resolveProvider,
-  sendWithPhoneVariants,
-  type OutboundMessage,
-} from '@/lib/whatsapp/providers';
+import { loadConversationRoute } from './conversation-route';
+import { assertChannelSupports } from './registry';
+import type { ChannelMessage } from './types';
 
 export interface BotSendArgs {
-  /** Tenancy key — drives the contact + provider lookups. */
+  /** Tenancy key — drives the conversation + channel lookups. */
   accountId: string;
   conversationId: string;
+  /** Kept for callers' logs; the recipient comes from the conversation. */
   contactId: string;
-  message: OutboundMessage;
+  message: ChannelMessage;
   /** Badge the persisted row as an AI reply. */
   aiGenerated?: boolean;
 }
@@ -31,30 +29,20 @@ export interface BotSendArgs {
 export async function sendBotMessage(
   args: BotSendArgs
 ): Promise<{ whatsapp_message_id: string }> {
-  const { accountId, conversationId, contactId, message } = args;
+  const { accountId, conversationId, message } = args;
   const db = supabaseAdmin();
 
-  const { data: contact, error: contactErr } = await db
-    .from('contacts')
-    .select('id, phone')
-    .eq('id', contactId)
-    .eq('account_id', accountId)
-    .maybeSingle();
-  if (contactErr || !contact?.phone) {
-    throw new Error('contact not found for this account');
+  const route = await loadConversationRoute(db, accountId, conversationId);
+  if (!route || route.recipient.contactId !== args.contactId) {
+    throw new Error('conversation not found for this account');
   }
 
-  const sanitized = sanitizePhoneForMeta(contact.phone);
-  if (!isValidE164(sanitized)) {
-    throw new Error(`contact phone invalid: ${contact.phone}`);
-  }
+  assertChannelSupports(route.channelType, route.adapter.capabilities, message);
 
-  const provider = await resolveProvider(db, accountId);
-  const sent = await sendWithPhoneVariants(provider, sanitized, message);
-
-  if (sent.phone !== sanitized) {
-    await db.from('contacts').update({ phone: sent.phone }).eq('id', contact.id);
-  }
+  const sent = await route.adapter.send(
+    { db, accountId, conversationId, channel: route.channel, recipient: route.recipient },
+    message
+  );
 
   const row = toMessageRow(message, sent.renderedText);
   const { error: msgErr } = await db.from('messages').insert({
@@ -68,7 +56,7 @@ export async function sendBotMessage(
   if (msgErr) {
     // The customer already has the message; surface the DB failure
     // without pretending the send failed silently.
-    throw new Error(`sent via ${provider.id} but DB insert failed: ${msgErr.message}`);
+    throw new Error(`sent via ${sent.via} but DB insert failed: ${msgErr.message}`);
   }
 
   await db
@@ -80,12 +68,13 @@ export async function sendBotMessage(
     })
     .eq('id', conversationId);
 
+  // Field name kept for the engines' existing contract.
   return { whatsapp_message_id: sent.messageId };
 }
 
 /** `messages` columns + conversation-list preview for an outbound message. */
 function toMessageRow(
-  message: OutboundMessage,
+  message: ChannelMessage,
   renderedText?: string
 ): { columns: Record<string, unknown>; preview: string } {
   switch (message.type) {

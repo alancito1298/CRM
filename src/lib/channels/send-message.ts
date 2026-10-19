@@ -5,8 +5,8 @@
 //
 // Given a conversation and message params, this:
 //   1. validates the params for the message type,
-//   2. loads the conversation + contact + WhatsApp config,
-//   3. sends to Meta (with phone-variant retry + contact auto-fix),
+//   2. resolves the conversation's channel + recipient,
+//   3. sends through that channel's adapter,
 //   4. persists the message + updates the conversation,
 //   5. pauses any active Flow run for the contact (agent stepped in).
 //
@@ -14,9 +14,7 @@
 // `accountId` and throws `SendMessageError` on failure. The callers
 // own auth, rate-limiting, body parsing, and mapping the error to
 // their respective response shapes (internal `{ error }` vs the v1
-// envelope). Behaviour is identical to the original inline route —
-// this is a straight extraction so the public endpoint can reuse it
-// without duplicating ~250 lines of Meta plumbing.
+// envelope).
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -29,14 +27,15 @@ import {
   type InteractiveMessagePayload,
 } from '@/lib/whatsapp/interactive';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
-import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
+import type { OutboundMessage } from '@/lib/whatsapp/providers';
+import { loadConversationRoute, type ConversationRoute } from './conversation-route';
+import { assertChannelSupports } from './registry';
 import {
-  resolveProvider,
-  sendWithPhoneVariants,
-  WhatsAppNotConfiguredError,
-  type OutboundMessage,
-  type WhatsAppProvider,
-} from '@/lib/whatsapp/providers';
+  ChannelNotConfiguredError,
+  InvalidRecipientError,
+  UnsupportedMessageError,
+  type ChannelSendResult,
+} from './types';
 import type { MessageTemplate } from '@/types';
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard';
 import { checkActionAllowed, recordMessageSent } from '@/lib/saas/plans';
@@ -85,7 +84,8 @@ export interface SendMessageParams {
 export interface SendMessageResult {
   /** Our `messages.id` (the persisted row). */
   messageId: string;
-  /** Meta's `wamid` for the delivered message. */
+  /** Network-side id of the delivered message (field name predates
+   *  channels — it is part of the public v1 contract). */
   whatsappMessageId: string;
 }
 
@@ -223,52 +223,23 @@ export async function sendMessageToConversation(
 
   const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(messageType);
 
-  // Conversation + contact, account-scoped.
-  const { data: conversation, error: convError } = await db
-    .from('conversations')
-    .select('*, contact:contacts(*)')
-    .eq('id', conversationId)
-    .eq('account_id', accountId)
-    .single();
-
-  if (convError || !conversation) {
+  // Conversation → channel + recipient, account-scoped.
+  let route: ConversationRoute | null;
+  try {
+    route = await loadConversationRoute(db, accountId, conversationId);
+  } catch (err) {
+    throw toSendError(err);
+  }
+  if (!route) {
     throw new SendMessageError('not_found', 'Conversation not found', 404);
   }
+  const contact = route.contact;
 
-  const contact = conversation.contact;
-  if (!contact?.phone) {
-    throw new SendMessageError(
-      'bad_request',
-      'Contact phone number not found',
-      400
-    );
-  }
-
-  const sanitizedPhone = sanitizePhoneForMeta(contact.phone);
-  if (!isValidE164(sanitizedPhone)) {
-    throw new SendMessageError(
-      'bad_request',
-      'Invalid phone number format',
-      400
-    );
-  }
-
-  // Provider for this account (WA Web / Meta / Twilio).
-  let provider: WhatsAppProvider;
-  try {
-    provider = await resolveProvider(db, accountId);
-  } catch (err) {
-    if (err instanceof WhatsAppNotConfiguredError) {
-      throw new SendMessageError('whatsapp_not_configured', err.message, 400);
-    }
-    throw err;
-  }
-
-  // Resolve the reply target to its Meta message_id. The parent must
+  // Resolve the reply target to its network message id. The parent must
   // belong to this same conversation — otherwise a caller could quote
   // messages they can't see by guessing UUIDs.
   let contextMessageId: string | undefined;
-  if (replyToMessageId) {
+  if (replyToMessageId && route.adapter.capabilities.replyContext) {
     const { data: parent, error: parentError } = await db
       .from('messages')
       .select('message_id, conversation_id')
@@ -285,7 +256,7 @@ export async function sendMessageToConversation(
     }
     if (!parent.message_id) {
       console.warn(
-        '[send-message] reply target has no Meta message_id; sending without context'
+        '[send-message] reply target has no network message_id; sending without context'
       );
     } else {
       contextMessageId = parent.message_id;
@@ -337,32 +308,18 @@ export async function sendMessageToConversation(
             }
           : { type: 'text', text: contentText! };
 
-  // Phone-variant retry; persist a working variant back to the contact
-  // so the next send goes straight through.
-  let waMessageId: string;
-  let workingPhone: string;
+  let sent: ChannelSendResult;
   try {
-    const sent = await sendWithPhoneVariants(provider, sanitizedPhone, outbound, {
-      contextMessageId,
-    });
-    waMessageId = sent.messageId;
-    workingPhone = sent.phone;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unknown provider error';
-    console.error(`[send-message] ${provider.id} send failed for all variants:`, message);
-    // Code kept as 'meta_error' — it is part of the public v1 API contract.
-    throw new SendMessageError('meta_error', `WhatsApp send error (${provider.id}): ${message}`, 502);
-  }
-
-  if (workingPhone !== sanitizedPhone) {
-    console.log(
-      `[send-message] Auto-corrected contact phone: ${sanitizedPhone} → ${workingPhone}`
+    assertChannelSupports(route.channelType, route.adapter.capabilities, outbound);
+    sent = await route.adapter.send(
+      { db, accountId, conversationId, channel: route.channel, recipient: route.recipient },
+      outbound,
+      { contextMessageId }
     );
-    await db
-      .from('contacts')
-      .update({ phone: workingPhone })
-      .eq('id', contact.id);
+  } catch (err) {
+    throw toSendError(err, route.channelType);
   }
+  const waMessageId = sent.messageId;
 
   // Persist the sent message. Field names MUST match the messages
   // schema (see 001_initial_schema.sql).
@@ -394,7 +351,7 @@ export async function sendMessageToConversation(
     console.error('[send-message] error inserting sent message:', msgError);
     throw new SendMessageError(
       'db_error',
-      `Message sent to Meta but failed to save to DB: ${msgError.message}`,
+      `Message sent via ${sent.via} but failed to save to DB: ${msgError.message}`,
       500
     );
   }
@@ -446,4 +403,23 @@ export async function sendMessageToConversation(
   }
 
   return { messageId: messageRecord.id, whatsappMessageId: waMessageId };
+}
+
+/** Map channel-layer failures onto the send error family the routes handle. */
+function toSendError(err: unknown, channelType?: string): unknown {
+  if (err instanceof SendMessageError) return err;
+  if (err instanceof ChannelNotConfiguredError) {
+    // 'whatsapp_not_configured' is part of the public v1 API contract.
+    const code =
+      err.channelType === 'whatsapp' ? 'whatsapp_not_configured' : 'channel_not_configured';
+    return new SendMessageError(code, err.message, 400);
+  }
+  if (err instanceof InvalidRecipientError || err instanceof UnsupportedMessageError) {
+    return new SendMessageError('bad_request', err.message, 400);
+  }
+  if (!channelType) return err;
+  const message = err instanceof Error ? err.message : 'Unknown provider error';
+  console.error(`[send-message] ${channelType} send failed:`, message);
+  // Code kept as 'meta_error' — it is part of the public v1 API contract.
+  return new SendMessageError('meta_error', `${channelType} send error: ${message}`, 502);
 }

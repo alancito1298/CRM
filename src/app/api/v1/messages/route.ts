@@ -38,7 +38,7 @@ import {
   sendMessageToConversation,
   validateSendMessageParams,
   SendMessageError,
-} from '@/lib/whatsapp/send-message';
+} from '@/lib/channels/send-message';
 import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive';
 
 export async function POST(request: Request) {

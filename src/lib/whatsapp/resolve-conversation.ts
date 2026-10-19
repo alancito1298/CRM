@@ -9,7 +9,7 @@
 //
 // It deliberately reuses the exact find-or-create logic the inbound
 // webhook uses (the `findExistingContact` dedupe helper, the
-// one-conversation-per-(account, contact) convention, the
+// one-conversation-per-(account, contact, channel) convention, the
 // account_id-tenancy / user_id-audit split) so a contact created via
 // the API is indistinguishable from one created by an inbound message.
 //
@@ -22,8 +22,9 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe';
 import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
-import { SendMessageError } from '@/lib/whatsapp/send-message';
+import { SendMessageError } from '@/lib/channels/send-message';
 import { resolveAuditUserId, ContactError } from '@/lib/api/v1/contacts';
+import { resolveWhatsAppChannelId } from './channel-adapter';
 
 export interface ResolvedConversation {
   conversationId: string;
@@ -67,6 +68,8 @@ export async function resolveConversationByPhone(
       400
     );
   }
+  const channelId = await resolveWhatsAppChannelId(db, accountId);
+  if (!channelId) throw new SendMessageError('db_error', 'WhatsApp channel unavailable', 500);
 
   // Audit user for created rows = the single account-wide default used
   // by every public-API write (see resolveAuditUserId), so a contact
@@ -137,7 +140,7 @@ export async function resolveConversationByPhone(
   }
 
   // ---- conversation -------------------------------------------
-  // One conversation per (account, contact) — same convention as the
+  // One conversation per (account, contact, channel) — same convention as the
   // webhook. Order oldest-first and take one row rather than
   // `.maybeSingle()`, which errors on ≥2 rows: if duplicates predate the
   // unique index (migration 036), we resolve to the canonical survivor
@@ -146,15 +149,16 @@ export async function resolveConversationByPhone(
     db,
     accountId,
     contactId,
-    ownerUserId
+    ownerUserId,
+    channelId
   );
 
   return { conversationId, contactId, contactCreated };
 }
 
 /**
- * Find (oldest-first) or create the single conversation for
- * `(accountId, contactId)`. Handles the unique-index race the same way
+ * Find (oldest-first) or create the WhatsApp conversation for
+ * `(accountId, contactId, channelId)`. Handles the unique-index race the same way
  * the inbound webhook does: on a 23505 from a concurrent create,
  * re-resolve the winning row rather than failing the send.
  */
@@ -162,13 +166,15 @@ async function findOrCreateConversationRow(
   db: SupabaseClient,
   accountId: string,
   contactId: string,
-  ownerUserId: string
+  ownerUserId: string,
+  channelId: string
 ): Promise<string> {
   const { data: existing, error: findErr } = await db
     .from('conversations')
     .select('id')
     .eq('account_id', accountId)
     .eq('contact_id', contactId)
+    .eq('channel_id', channelId)
     .order('created_at', { ascending: true })
     .limit(1);
 
@@ -187,6 +193,7 @@ async function findOrCreateConversationRow(
       account_id: accountId,
       user_id: ownerUserId,
       contact_id: contactId,
+      channel_id: channelId,
     })
     .select('id')
     .single();
@@ -198,6 +205,7 @@ async function findOrCreateConversationRow(
         .select('id')
         .eq('account_id', accountId)
         .eq('contact_id', contactId)
+        .eq('channel_id', channelId)
         .order('created_at', { ascending: true })
         .limit(1);
       if (raced && raced.length > 0) {

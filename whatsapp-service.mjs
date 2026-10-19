@@ -732,6 +732,12 @@ async function saveMessage(session, { phone, name, body, mediaUrl, contentType =
     }
 
     const timestamp = createdAt || new Date().toISOString();
+    const { data: channelId, error: channelError } = await supabase
+      .rpc('ensure_whatsapp_channel', { p_account_id: accountId });
+    if (channelError || !channelId) throw new Error('WhatsApp channel unavailable');
+    const { data: identity } = await supabase.from('contact_identities')
+      .select('id').eq('account_id', accountId).eq('contact_id', contact.id)
+      .eq('channel_type', 'whatsapp').order('created_at').limit(1).maybeSingle();
 
     const validDbTypes = new Set(['text', 'image', 'document', 'audio', 'video', 'location', 'template']);
     let finalContentType = contentType;
@@ -747,6 +753,7 @@ async function saveMessage(session, { phone, name, body, mediaUrl, contentType =
     let { data: conversation } = await supabase
       .from('conversations').select('id, last_message_at, unread_count, status')
       .eq('account_id', accountId).eq('contact_id', contact.id)
+      .eq('channel_id', channelId)
       .order('created_at', { ascending: false }).limit(1).maybeSingle();
 
     if (!conversation) {
@@ -754,6 +761,7 @@ async function saveMessage(session, { phone, name, body, mediaUrl, contentType =
         .from('conversations')
         .insert({
           account_id: accountId, user_id: userId, contact_id: contact.id,
+          channel_id: channelId, contact_identity_id: identity?.id || null,
           status: 'open', last_message_at: timestamp,
           last_message_text: previewText.slice(0, 255) || '',
           unread_count: (!isHistoric && senderType === 'customer') ? 1 : 0,

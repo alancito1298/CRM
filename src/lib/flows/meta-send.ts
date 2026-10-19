@@ -3,12 +3,12 @@ import type {
   InteractiveListSection,
   MediaKind,
 } from '@/lib/whatsapp/meta-api'
-import { sendBotMessage } from '@/lib/whatsapp/bot-send'
+import { sendBotMessage } from '@/lib/channels/bot-send'
 
 // ------------------------------------------------------------
-// Flows-side sender. Thin adapter over `sendBotMessage`, which owns
-// provider resolution (WA Web / Meta / Twilio), phone-variant retry
-// and persistence for every bot send. Signatures are kept stable for
+// Flows-side sender. Thin adapter over `sendBotMessage`, which routes
+// through the conversation's channel (WhatsApp, Instagram, …) and owns
+// persistence for every bot send. Signatures are kept stable for
 // the runner and the AI auto-reply.
 // ------------------------------------------------------------
 

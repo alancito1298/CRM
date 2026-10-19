@@ -632,20 +632,24 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
  * Pick the conversation a send-type step should use. Prefer the id the
  * webhook handed us (it's the one that just got the inbound message);
  * fall back to the contact's conversation for resumed/wait paths and
- * manual engine POSTs. Throws if none exists — send steps have
- * no meaningful target without a conversation.
+ * manual engine POSTs — the one the customer wrote on most recently,
+ * since a contact may have one conversation per channel. Throws if none
+ * exists — send steps have no meaningful target without a conversation.
  */
 async function resolveConversationId(args: ExecuteArgs): Promise<string> {
   const fromCtx = args.context.conversation_id
   if (fromCtx) return fromCtx
   if (!args.contactId) throw new Error('cannot resolve conversation: no contact')
-  const { data, error } = await supabaseAdmin()
+  const { data: rows, error } = await supabaseAdmin()
     .from('conversations')
     .select('id')
     .eq('account_id', args.automation.account_id)
     .eq('contact_id', args.contactId)
-    .maybeSingle()
+    .order('last_inbound_at', { ascending: false, nullsFirst: false })
+    .order('created_at', { ascending: true })
+    .limit(1)
   if (error) throw new Error(`conversation lookup failed: ${error.message}`)
+  const data = rows?.[0]
   if (!data?.id) {
     const prefix = args.triggerEvent === 'tag_added'
       ? 'tag_added automation cannot send'
