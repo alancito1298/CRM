@@ -48,13 +48,16 @@ _Actualizado el 19 de octubre de 2026. Este archivo reemplaza la lista anterior;
 ### Instagram: mejoras después de la primera prueba
 
 - [x] Guardar el ID profesional (`/me?fields=user_id`) en vez del ID de OAuth; sin esto los webhooks se descartan. Hay que reconectar la cuenta una vez.
-- [ ] Botón **Desconectar**: canal a `disconnected`, borrar token, conservar historial. Marcar desconectado también si el usuario quita la app desde Instagram.
 - [x] Prueba real 19/10: DM entrante llega al inbox y la respuesta sale desde el CRM.
-- [ ] Suscribir la cuenta al webhook automáticamente al conectar (`POST /{ig-user-id}/subscribed_apps`); hoy se activó a mano en Meta.
-- [ ] Nombre del contacto: pedir `name`/`username`/foto del IGSID a la API; hoy muestra el número.
-- [ ] Inbox: el contador "23h remaining" se superpone con un ícono; el aviso "WhatsApp is not connected" aparece aunque haya Instagram conectado.
-- [ ] Mostrar `@usuario` en vez del ID numérico en Ajustes.
-- [ ] Varias cuentas por CRM: migración que quite el único `idx_instagram_connections_account`, callback que agregue en vez de reemplazar, lista de cuentas en Ajustes, cuenta de entrada visible en el inbox y límite por plan en `plans.ts`.
+- [x] Suscripción automática al webhook al conectar (`POST /me/subscribed_apps`).
+- [x] Nombre, `@usuario` y foto del contacto desde la API de Instagram.
+- [x] Inbox: contador de 24 h sin superponerse; aviso de WhatsApp oculto si hay otro canal conectado.
+- [x] Ajustes: lista de cuentas con `@usuario`, estado, Desconectar y Reconectar.
+- [x] Varias cuentas por CRM con límite por plan (`INSTAGRAM_ACCOUNTS_BY_PLAN`: 1/2/5/20). Migración 047.
+- [x] Token vencido o revocado: el canal pasa a "Requiere reconexión".
+- [ ] Correr la migración 047 en Supabase.
+- [ ] Cargar en Meta la URL de desautorización: `https://crm-phi-blue.vercel.app/api/instagram/deauthorize`.
+- [ ] Probar en producción: conectar 2 cuentas, desconectar una, contacto con nombre y foto.
 
 ### Revisión antes del despliegue
 
