@@ -826,6 +826,7 @@
       "backAria": "Back"
     },
     "builder": {
+      "delete": "Delete",
       "steps": {
         "send_message": "Send Message",
         "send_buttons": "Send Buttons",
@@ -1692,11 +1693,6 @@
       "reindex": "Reindex",
       "reindexTooltip": "Re-embed all documents (e.g. after adding an embeddings key)",
       "loading": "Loading…"
-    }
-  },
-  "Automations": {
-    "builder": {
-      "delete": "Delete"
     }
   }
 }

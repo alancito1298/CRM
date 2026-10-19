@@ -75,7 +75,7 @@ export async function dispatchInboundToAiReply(
     if (convErr || !conv) return
     if (conv.assigned_agent_id) return // a human owns this thread
     if (conv.ai_autoreply_disabled) return
-    const maxReplies = Math.max(config.autoReplyMaxPerConversation || 10, 500)
+    const maxReplies = Math.max(1, config.autoReplyMaxPerConversation || 10)
     if (conv.ai_reply_count >= maxReplies) return
 
     const messages = await buildConversationContext(db, conversationId)
@@ -134,11 +134,13 @@ export async function dispatchInboundToAiReply(
       })
       const update: Record<string, unknown> = {
         ai_handoff_summary: summary,
+        ai_autoreply_disabled: true,
       }
       if (config.handoffAgentId && !conv.assigned_agent_id) {
         update.assigned_agent_id = config.handoffAgentId
       }
       await db.from('conversations').update(update).eq('id', conversationId)
+      return
     }
 
     let replyText = (text || '').trim()

@@ -1,15 +1,14 @@
 import { NextResponse, after } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { normalizePhone } from '@/lib/whatsapp/phone-utils';
-import { findExistingContact } from '@/lib/contacts/dedupe';
-import { runAutomationsForTrigger } from '@/lib/automations/engine';
-import { dispatchInboundToFlows } from '@/lib/flows/engine';
-import { dispatchWebhookEvent } from '@/lib/webhooks/deliver';
+import { verifyTwilioSignature } from '@/lib/whatsapp/twilio-api';
+import { resolveWhatsAppChannelId } from '@/lib/whatsapp/channel-adapter';
+import { ingestInbound, type InboundContentType } from '@/lib/channels';
 
 export const maxDuration = 60;
 
-let _adminClient: any = null;
-function supabaseAdmin() {
+let _adminClient: SupabaseClient | null = null;
+function supabaseAdmin(): SupabaseClient {
   if (!_adminClient) {
     _adminClient = createClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -21,15 +20,31 @@ function supabaseAdmin() {
 
 export async function POST(request: Request) {
   try {
+    const { TWILIO_AUTH_TOKEN, TWILIO_ACCOUNT_ID, TWILIO_PHONE_NUMBER } = process.env;
+    if (!TWILIO_AUTH_TOKEN || !TWILIO_ACCOUNT_ID || !TWILIO_PHONE_NUMBER) {
+      console.error('[Twilio Webhook] Missing account, number, or auth token configuration.');
+      return NextResponse.json({ error: 'Webhook is not configured' }, { status: 503 });
+    }
+
     const formData = await request.formData();
     const params: Record<string, string> = {};
     formData.forEach((value, key) => {
       params[key] = value.toString();
     });
 
+    if (!verifyTwilioSignature({
+      authToken: TWILIO_AUTH_TOKEN,
+      signature: request.headers.get('x-twilio-signature'),
+      url: request.url,
+      params,
+    })) {
+      return NextResponse.json({ error: 'Invalid signature' }, { status: 403 });
+    }
+
     const from = params.From || '';
     const to = params.To || '';
     const body = params.Body || '';
+    const profileName = params.ProfileName || null;
     const messageSid = params.MessageSid || '';
     const numMedia = parseInt(params.NumMedia || '0', 10);
     const mediaUrl = numMedia > 0 ? params.MediaUrl0 : null;
@@ -38,12 +53,16 @@ export async function POST(request: Request) {
     const rawSender = from.replace(/^whatsapp:/i, '');
     const rawRecipient = to.replace(/^whatsapp:/i, '');
     const senderPhone = normalizePhone(rawSender);
+    if (!senderPhone || normalizePhone(rawRecipient) !== normalizePhone(TWILIO_PHONE_NUMBER)) {
+      return NextResponse.json({ error: 'Unknown recipient' }, { status: 403 });
+    }
 
     after(async () => {
       try {
         await processTwilioWebhook({
+          accountId: TWILIO_ACCOUNT_ID,
           senderPhone,
-          recipientPhone: rawRecipient,
+          profileName,
           body,
           messageSid,
           mediaUrl,
@@ -65,102 +84,33 @@ export async function POST(request: Request) {
 }
 
 async function processTwilioWebhook({
+  accountId,
   senderPhone,
-  recipientPhone,
+  profileName,
   body,
   messageSid,
   mediaUrl,
   mediaContentType,
 }: {
+  accountId: string;
   senderPhone: string;
-  recipientPhone: string;
+  profileName: string | null;
   body: string;
   messageSid: string;
   mediaUrl: string | null;
   mediaContentType: string | null;
 }) {
-  const { data: configRows } = await supabaseAdmin()
-    .from('whatsapp_config')
-    .select('*')
-    .or(`phone_number_id.eq.${recipientPhone},waba_id.eq.${recipientPhone}`);
-
-  let config = configRows && configRows.length > 0 ? configRows[0] : null;
-
-  if (!config) {
-    const { data: fallback } = await supabaseAdmin()
-      .from('whatsapp_config')
-      .select('*')
-      .limit(1)
-      .maybeSingle();
-    config = fallback;
-  }
-
-  if (!config) {
-    console.error('[Twilio Webhook] No active whatsapp_config found in DB.');
+  const { data: account, error } = await supabaseAdmin()
+    .from('accounts')
+    .select('id, owner_user_id')
+    .eq('id', accountId)
+    .maybeSingle();
+  if (error || !account) {
+    console.error('[Twilio Webhook] Configured account not found:', error);
     return;
   }
 
-  const accountId = config.account_id;
-  const configOwnerUserId = config.user_id;
-
-  let contactRecord = await findExistingContact(supabaseAdmin(), accountId, senderPhone);
-  let wasCreated = false;
-
-  if (!contactRecord) {
-    const { data: newContact, error: contactErr } = await supabaseAdmin()
-      .from('contacts')
-      .insert({
-        account_id: accountId,
-        user_id: configOwnerUserId,
-        phone: senderPhone,
-        name: senderPhone,
-      })
-      .select()
-      .single();
-
-    if (contactErr || !newContact) {
-      console.error('[Twilio Webhook] Error creating contact:', contactErr);
-      return;
-    }
-    contactRecord = newContact;
-    wasCreated = true;
-  }
-
-  if (!contactRecord) return;
-
-  const { data: existingConvs } = await supabaseAdmin()
-    .from('conversations')
-    .select('*')
-    .eq('account_id', accountId)
-    .eq('contact_id', contactRecord.id)
-    .order('created_at', { ascending: true })
-    .limit(1);
-
-  let conversation = existingConvs && existingConvs.length > 0 ? existingConvs[0] : null;
-
-  if (!conversation) {
-    const { data: newConv, error: convErr } = await supabaseAdmin()
-      .from('conversations')
-      .insert({
-        account_id: accountId,
-        user_id: configOwnerUserId,
-        contact_id: contactRecord.id,
-      })
-      .select()
-      .single();
-
-    if (convErr || !newConv) {
-      console.error('[Twilio Webhook] Error creating conversation:', convErr);
-      return;
-    }
-    conversation = newConv;
-    await dispatchWebhookEvent(supabaseAdmin(), accountId, 'conversation.created', {
-      conversation_id: conversation.id,
-      contact_id: contactRecord.id,
-    });
-  }
-
-  let contentType = 'text';
+  let contentType: InboundContentType = 'text';
   if (mediaContentType) {
     if (mediaContentType.startsWith('image/')) contentType = 'image';
     else if (mediaContentType.startsWith('video/')) contentType = 'video';
@@ -168,45 +118,21 @@ async function processTwilioWebhook({
     else contentType = 'document';
   }
 
-  const { error: msgErr } = await supabaseAdmin().from('messages').insert({
-    conversation_id: conversation.id,
-    sender_type: 'customer',
-    content_type: contentType,
-    content_text: body || null,
-    media_url: mediaUrl,
-    message_id: messageSid || `twilio-${Date.now()}`,
-    status: 'delivered',
-    created_at: new Date().toISOString(),
-  });
-
-  if (msgErr) {
-    console.error('[Twilio Webhook] Error inserting message:', msgErr);
-    return;
-  }
-
-  await supabaseAdmin()
-    .from('conversations')
-    .update({
-      last_message_text: body || `[${contentType}]`,
-      last_message_at: new Date().toISOString(),
-      unread_count: (conversation.unread_count || 0) + 1,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', conversation.id);
-
-  await dispatchInboundToFlows({
+  await ingestInbound(supabaseAdmin(), {
     accountId,
-    userId: configOwnerUserId,
-    contactId: contactRecord.id,
-    conversationId: conversation.id,
-    message: { kind: 'text', text: body, meta_message_id: messageSid },
-    isFirstInboundMessage: wasCreated,
+    auditUserId: account.owner_user_id,
+    channelType: 'whatsapp',
+    channelId: await resolveWhatsAppChannelId(supabaseAdmin(), accountId),
+    sender: { externalId: senderPhone, displayName: profileName },
+    event: {
+      kind: 'message',
+      externalMessageId: messageSid || `twilio-${Date.now()}`,
+      sentAt: new Date(),
+      contentType,
+      text: body || null,
+      mediaUrl,
+      interactiveReplyId: null,
+      previewFallback: `[${contentType}]`,
+    },
   });
-
-  await runAutomationsForTrigger({
-    accountId,
-    triggerType: 'new_message_received',
-    contactId: contactRecord.id,
-    context: { message_text: body, conversation_id: conversation.id },
-  }).catch((err) => console.error('[Twilio Automations] Error:', err));
 }

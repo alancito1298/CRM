@@ -826,6 +826,7 @@
       "backAria": "Back"
     },
     "builder": {
+      "delete": "Eliminar",
       "steps": {
         "send_message": "Send Message",
         "send_buttons": "Send Buttons",
@@ -1692,11 +1693,6 @@
       "reindex": "Reindexar",
       "reindexTooltip": "Volver a indexar todos los documentos para búsqueda semántica",
       "loading": "Cargando…"
-    }
-  },
-  "Automations": {
-    "builder": {
-      "delete": "Eliminar"
     }
   }
 }

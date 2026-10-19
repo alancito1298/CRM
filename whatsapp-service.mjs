@@ -235,7 +235,7 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
   const { accountId, client } = session;
   try {
     // ── FILTRO MODO PRUEBAS: Solo responder a números autorizados ──
-    const ALLOWED_TEST_PHONE = process.env.AI_TEST_PHONE_ONLY || '1168863090,3445416457';
+    const ALLOWED_TEST_PHONE = process.env.AI_TEST_PHONE_ONLY || '';
     if (ALLOWED_TEST_PHONE) {
       const cleanContact = normalizePhone(contactPhone);
       const allowedList = ALLOWED_TEST_PHONE.split(',').map(p => normalizePhone(p)).filter(Boolean);
@@ -404,12 +404,10 @@ async function handleAiAutoReply(session, { conversationId, contactPhone }) {
       }
     }
 
-    // Soporte opcional para número inline: [NOTIFICAR_CIERRE: 1168863090 | resumen...]
+    // El modelo puede escribir un número en el resumen; nunca usarlo como destino.
     if (closureSummary && closureSummary.includes('|')) {
       const parts = closureSummary.split('|');
-      const possiblePhone = normalizePhone(parts[0]);
-      if (possiblePhone.length >= 8 && possiblePhone.length <= 15) {
-        adminNotifyPhone = possiblePhone;
+      if (/^[+\d\s-]{8,20}$/.test(parts[0].trim())) {
         closureSummary = parts.slice(1).join('|').trim();
       }
     }

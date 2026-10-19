@@ -826,6 +826,7 @@
       "backAria": "뒤로"
     },
     "builder": {
+      "delete": "삭제",
       "steps": {
         "send_message": "메시지 보내기",
         "send_buttons": "버튼 보내기",
@@ -1496,7 +1497,14 @@
       "step4_3": "위의 <strong>웹훅 콜백 URL</strong>을 붙여넣기",
       "step4_4": "여기서 설정한 것과 동일한 <strong>인증 토큰</strong>을 입력",
       "step4_5": "\"messages\" 웹훅 필드를 구독",
-      "metaDocs": "Meta WhatsApp API 문서"
+      "metaDocs": "Meta WhatsApp API 문서",
+      "providerTitle": "제공업체 선택",
+      "providerMeta": "Meta Cloud API (공식 직접 연결)",
+      "providerTwilio": "Twilio BSP (WhatsApp 비즈니스 제공업체)",
+      "twilioAccountSid": "Twilio 계정 SID",
+      "twilioAuthToken": "Twilio 인증 토큰",
+      "twilioPhoneNumber": "Twilio WhatsApp 전화번호",
+      "twilioWebhookHint": "Twilio 콘솔에서 이 URL을 메시징 서비스 또는 웹훅 URL로 사용하세요:"
     },
     "sections": {
       "overview": "개요",

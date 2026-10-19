@@ -183,13 +183,13 @@ export async function getAccountLiveUsage(
   try {
     const [contactsRes, membersRes, flowsRes] = await Promise.all([
       supabase.from('contacts').select('id', { count: 'exact', head: true }).eq('account_id', accountId),
-      supabase.from('account_members').select('id', { count: 'exact', head: true }).eq('account_id', accountId),
+      supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('account_id', accountId),
       supabase.from('flows').select('id', { count: 'exact', head: true }).eq('account_id', accountId),
     ]);
 
     return {
       contacts: contactsRes.count ?? 0,
-      agents: (membersRes.count ?? 0) + 1, // +1 for owner
+      agents: membersRes.count ?? 0,
       flows: flowsRes.count ?? 0,
     };
   } catch (err) {

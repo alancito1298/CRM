@@ -41,10 +41,7 @@ export async function GET() {
       .select('account_id, plan_id, status, messages_used_this_month, plans(slug, name)');
 
     // Métricas totales
-    const [contactsCount, membersCount] = await Promise.all([
-      adminDb.from('contacts').select('id', { count: 'exact', head: true }),
-      adminDb.from('account_members').select('id', { count: 'exact', head: true }),
-    ]);
+    const contactsCount = await adminDb.from('contacts').select('id', { count: 'exact', head: true });
 
     // Combinar información por tenant
     const profileMap = new Map((profiles || []).map((p) => [p.user_id, p]));

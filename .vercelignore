@@ -13,3 +13,11 @@ skills-lock.json
 setup_database.sql
 *.log
 *.tsbuildinfo
+
+# Secretos y archivos locales
+.env*
+!.env.local.example
+client_secret*.json
+*.pdf
+mcp-server
+.wwebjs*
