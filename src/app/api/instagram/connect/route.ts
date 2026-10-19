@@ -14,7 +14,12 @@ export async function GET(request: NextRequest) {
     url.searchParams.set('client_id', appId);
     url.searchParams.set('redirect_uri', redirectUri);
     url.searchParams.set('response_type', 'code');
-    url.searchParams.set('scope', 'instagram_business_basic,instagram_business_manage_messages');
+    url.searchParams.set('scope', [
+      'instagram_business_basic',
+      'instagram_business_manage_messages',
+      'instagram_business_manage_comments',
+      'instagram_business_manage_insights',
+    ].join(','));
     url.searchParams.set('state', state);
 
     const response = NextResponse.redirect(url);
