@@ -924,7 +924,9 @@ export function MessageThread({
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold text-foreground">{displayName}</h2>
             <p className="truncate text-xs text-muted-foreground">
-              {conversation.channel?.type === 'instagram' ? 'Instagram' : contact.phone}
+              {conversation.channel?.type === 'instagram'
+                ? `Instagram${conversation.channel.name?.startsWith('@') ? ` · ${conversation.channel.name}` : ''}`
+                : contact.phone}
             </p>
           </div>
           {/* Session timer badge — hidden on the narrowest phones so

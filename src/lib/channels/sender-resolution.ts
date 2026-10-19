@@ -151,12 +151,24 @@ async function resolveIdentitySender(
 
   const existing = await findIdentity();
   if (existing?.contact) {
-    const profile = pickProfile(sender);
-    const changed = Object.entries(profile).some(([k, v]) => v && v !== existing[k]);
-    if (changed) {
-      await db.from('contact_identities').update(profile).eq('id', existing.id);
+    const changes = Object.fromEntries(
+      Object.entries(pickProfile(sender)).filter(([k, v]) => v && v !== existing[k])
+    );
+    if (Object.keys(changes).length > 0) {
+      await db.from('contact_identities').update(changes).eq('id', existing.id);
     }
-    return { contact: existing.contact, identityId: existing.id, wasCreated: false };
+    // Contacts created before the profile was known are named after the
+    // raw id; upgrade them once a real name arrives.
+    const contact = existing.contact as Row;
+    const betterName = sender.displayName || sender.username;
+    const contactChanges: Row = {};
+    if (betterName && (!contact.name || contact.name === sender.externalId)) contactChanges.name = betterName;
+    if (sender.avatarUrl && !contact.avatar_url) contactChanges.avatar_url = sender.avatarUrl;
+    if (Object.keys(contactChanges).length > 0) {
+      await db.from('contacts').update(contactChanges).eq('id', contact.id);
+      Object.assign(contact, contactChanges);
+    }
+    return { contact, identityId: existing.id, wasCreated: false };
   }
 
   const { data: contact, error: contactErr } = await db

@@ -1,7 +1,9 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { after, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
-import { ingestInbound, type InboundContentType } from '@/lib/channels';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { ingestInbound, type InboundContentType, type InboundSender } from '@/lib/channels';
+import { fetchInstagramProfile, getInstagramToken } from '@/lib/instagram/client';
 
 export const maxDuration = 60;
 
@@ -66,11 +68,14 @@ export async function POST(request: Request) {
       const { data: account } = await db.from('accounts').select('owner_user_id')
         .eq('id', channel.account_id).single();
       if (!account) continue;
+      // Also keeps the long-lived token refreshed while the account is active.
+      const token = await getInstagramToken(channel.account_id, channel.id).catch(() => null);
 
       for (const item of entry.messaging ?? []) {
         try {
           const senderId = item.sender?.id;
           if (!senderId || senderId === entry.id || item.message?.is_echo) continue;
+          const sender = await describeSender(db, channel.account_id, senderId, token);
           const event = item.message;
           const reaction = item.reaction;
           const postback = item.postback;
@@ -78,7 +83,7 @@ export async function POST(request: Request) {
             await ingestInbound(db, {
               accountId: channel.account_id, auditUserId: account.owner_user_id,
               channelType: 'instagram', channelId: channel.id,
-              sender: { externalId: senderId },
+              sender,
               event: { kind: 'reaction', externalMessageId: reaction.mid,
                 targetExternalId: reaction.mid,
                 emoji: reaction.action === 'unreact' ? null : reaction.emoji ?? null },
@@ -93,7 +98,7 @@ export async function POST(request: Request) {
           await ingestInbound(db, {
             accountId: channel.account_id, auditUserId: account.owner_user_id,
             channelType: 'instagram', channelId: channel.id,
-            sender: { externalId: senderId },
+            sender,
             event: {
               kind: 'message', externalMessageId: event?.mid ?? postback!.mid!,
               sentAt: new Date(item.timestamp ?? Date.now()),
@@ -112,4 +117,22 @@ export async function POST(request: Request) {
     }
   });
   return NextResponse.json({ received: true });
+}
+
+/** Sender with its Instagram profile, fetched only until we have a username. */
+async function describeSender(
+  db: SupabaseClient, accountId: string, senderId: string, token: string | null,
+): Promise<InboundSender> {
+  if (!token) return { externalId: senderId };
+  const { data: identity } = await db.from('contact_identities').select('username')
+    .eq('account_id', accountId).eq('channel_type', 'instagram')
+    .eq('external_id', senderId).maybeSingle();
+  if (identity?.username) return { externalId: senderId };
+  const profile = await fetchInstagramProfile(senderId, token);
+  return {
+    externalId: senderId,
+    displayName: profile?.name ?? null,
+    username: profile?.username ?? null,
+    avatarUrl: profile?.profilePic ?? null,
+  };
 }

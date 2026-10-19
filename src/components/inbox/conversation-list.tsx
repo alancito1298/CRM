@@ -515,7 +515,9 @@ function ConversationItem({
           </span>
           <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
             title={conversation.channel?.type ?? 'whatsapp'}>
-            {conversation.channel?.type === 'instagram' ? 'Instagram' : 'WhatsApp'}
+            {conversation.channel?.type === 'instagram'
+              ? (conversation.channel.name?.startsWith('@') ? conversation.channel.name : 'Instagram')
+              : 'WhatsApp'}
           </span>
           <span className="shrink-0 text-[10px] text-muted-foreground">{timeAgo}</span>
         </div>
