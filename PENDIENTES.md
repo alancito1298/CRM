@@ -55,8 +55,9 @@ _Actualizado el 19 de octubre de 2026. Este archivo reemplaza la lista anterior;
 - [x] Ajustes: lista de cuentas con `@usuario`, estado, Desconectar y Reconectar.
 - [x] Varias cuentas por CRM con límite por plan (`INSTAGRAM_ACCOUNTS_BY_PLAN`: 1/2/5/20). Migración 047.
 - [x] Token vencido o revocado: el canal pasa a "Requiere reconexión".
-- [ ] Correr la migración 047 en Supabase.
-- [ ] Cargar en Meta la URL de desautorización: `https://crm-phi-blue.vercel.app/api/instagram/deauthorize`.
+- [x] Migración 047 aplicada en Supabase. Cuenta de Cesar en plan Enterprise para pruebas.
+- [x] URL de desautorización cargada en Meta: `https://crm-phi-blue.vercel.app/api/instagram/deauthorize`.
+- [ ] URL de solicitud de eliminación de datos (callback de Meta): falta el endpoint; hoy solo está la página `/data-deletion`.
 - [ ] Probar en producción: conectar 2 cuentas, desconectar una, contacto con nombre y foto.
 
 ### Revisión antes del despliegue
