@@ -59,3 +59,7 @@ client_secret*.json
 # Capturas y archivos locales de herramientas (Playwright MCP, assets sueltos)
 .playwright-mcp/
 artifacts/
+
+# Staging local de otro proyecto (epirulos)
+.epirulos-stage/
+epirulos_stage.py
